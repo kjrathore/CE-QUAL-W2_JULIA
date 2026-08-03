@@ -1,0 +1,12 @@
+name = "W2J"
+uuid = "20cbb19a-941a-403e-bfd5-3d1bcf68a6d7"
+authors = ["Kunal J. Rathore<you@example.edu>"]
+version = "0.0.1"
+
+[deps]
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
+
+[compat]
+DataFrames = "1.8.2"
+julia = "1.11.3"
