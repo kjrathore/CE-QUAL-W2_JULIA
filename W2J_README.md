@@ -196,12 +196,22 @@ not a valid blank-separator OR a valid field row, and was silently merging the e
 CST table into the *preceding* entity block until `ends_block` was added to treat any
 non-blank, non-string column B as a block terminator too.
 
-**Known remaining limitation**: a handful of rows in the periphyton/epiphyton-group
-block (`EPIC`/`EPRC`, ~15 rows) repeat the same extracted key in an *interleaved* pattern
-(EPIC, EPRC, EPIC, EPRC, ...) rather than consecutive runs, which the "merge consecutive
-same-key rows into an array" logic doesn't catch -- these currently overwrite each other
-under a duplicate YAML key (YAML.jl warns but doesn't error; last value wins). Not yet
-fixed -- flagging rather than guessing at a fix without checking the manual first.
+**FIXED**: the periphyton/epiphyton-group block (`EPIC`/`EPRC`) had rows repeating the
+same extracted key in an *interleaved* pattern (EPIC, EPRC, EPIC, EPRC, ...), which the
+original "merge only *consecutive* same-key rows" logic didn't catch. Investigating (via
+`review_config.jl` surfacing the warnings during a normal run, not a dedicated audit)
+found this was one instance of a broader pattern, not a one-off: `SPILLWAYS`' upstream
+and downstream SPECIFY-elevation fields are BOTH labeled `ETUSP`/`EBUSP` in the source
+workbook (rows 201 and 206 -- the downstream one should logically be `ETDSP` to match
+the `KTDSP`/`KBDSP` naming two rows later, but the workbook itself has the mislabel, not
+just our extraction), and `GENERIC CONSTITUENT`'s `CGS` is reused for two unrelated
+fields ("Settling rate" and "Gas transfer saturation concentration", with `CGLDK`/`CGKLF`
+sitting between the two `CGS` rows). `emit_vertical_fields!` now groups by key across the
+*whole* block (preserving first-occurrence order) instead of only merging adjacent rows
+-- catches all three cases in one pass, confirmed by inspecting each one directly rather
+than assumed. Re-running `review_config.jl` against the regenerated `w2_config.yaml`
+shows **zero** duplicate-key warnings now (down from 3 known instances, ~30-something
+affected rows total).
 
 `W2J`'s `InputReader.jl` does NOT yet read `w2_config.yaml` -- this script only produces
 the file. Pointing `InputReader.jl` at YAML instead of `w2_con.csv` is future work.
@@ -235,21 +245,53 @@ multi-session effort, not a single pass.
 - **Branch & grid geometry** (2794-2820, 3306-3335, 3489-3494, 8417-8427): BS/BE sum vs
   NBR, US(1)=2, inter-branch inactive-segment spacing, DS(last)+1=IMX, SLOPE>=SLOPEC,
   UHS/DHS validity, JBDN within its own waterbody's branch range.
+- **Outlet structures** (8896-8969): NSTR=0 with an external downstream boundary is a
+  warning, NSTR>0 without one is an error, KTSTR/KBSTR ordering, SINKC must be LINE/
+  POINT, WSTR>0 when SINKC=LINE.
+- **Pipes** (8976-9119): WPI/DLXPI/FPI/FMINPI range checks, PUPIC/PDPIC/LATPIC/DYNPIPE
+  enum validity, KTUPI/KTDPI vs KBUPI/KBDPI ordering (downstream fields only checked
+  when IDPI != 0, matching the Fortran guard).
+- **Withdrawals** (9931-9968): IWD must not sit on a branch boundary segment, KTWD>=2,
+  KTWD<=KBWD.
+- **Tributaries** (9976-10010): PTRC enum validity, ITR must fall within some branch's
+  active segment range, ELTRT>=ELTRB when PTRC=SPECIFY.
 - **CST constituent activation** (10383-10443): CAC/CPRWBC must be ON/OFF, initial
   concentration < -2 is an error, initial concentration = 0 while active is a warning
   (exempting age/residence-time tracers -- see the exemption-logic note in the file;
   this caught a real bug where the exemption checked only the short name and missed
   `Gen1`/"Water age, days", which the Fortran source's own equivalent check would exempt).
 
-Run with `julia --project=. review_config.jl [path-to-w2_config.yaml]`. Against the real
-Detroit `w2_config.yaml`: **0 errors, 1 warning** (`ISS1` starts at zero concentration
-while active -- a legitimate, expected warning, not a bug).
+**Grid-elevation-dependent checks are deliberately skipped** -- a large fraction of the
+structures/pipes/withdrawals/tributaries checks in the Fortran source compare against
+`EL(K,I)` (computed layer elevation) and `KB(I)` (bottom active layer), both of which
+come from the geometry solve in `init-geom.F90`, not yet ported to W2J (see CLAUDE.md
+"Open questions" -- the `H(K,JW)` shape mismatch blocks this). Only checks that need
+nothing beyond the raw control-file values are ported; each function's docstring in
+`review_config.jl` says exactly which checks were left out and why.
+
+Run with `julia --project=. review_config.jl [path-to-w2_config.yaml] [path-to-log]`.
+Prints the report to stdout AND writes the identical text to a log file (default
+`<yaml_path's directory>/Outputs/reviewed.log`, e.g. `DetroitReservoir/Outputs/
+reviewed.log` -- matching the project's existing `Outputs/` convention from
+`LongitudinalProfile.jl`) so the run is a durable, revisitable artifact, not just
+terminal scrollback. Against the real Detroit `w2_config.yaml`: **0 errors, 1 warning**
+(`ISS1` starts at zero concentration while active -- a legitimate, expected warning, not
+a bug). Sanity-checked by mutating a copy of the config in-memory (bad `SINKC`,
+`KTWD`>`KBWD`, out-of-grid `ITR`) and confirming all three fire correctly -- a clean run
+isn't proof the checks aren't dead code.
+
+Also fixed a real bug found while expanding scope: YAML `null` parses to Julia `nothing`,
+and `string(nothing)` is the literal text `"nothing"` -- unguarded string checks (e.g. on
+`PUPIC`/`DYNPIPE` for the `PIPES` section, all null when `NPI=0`) were treating that as
+real, invalid data and raising false-positive errors. Fixed via a single `str_or_empty`
+helper used by every string-valued check now, rather than patching each site ad hoc.
 
 **A clean run of this script does not mean the control file is fully valid** -- roughly
-1,150 more checks from the reference preprocessor are not ported yet. Each check in
-`review_config.jl` cites its source line range in `pre_ivf_422.f90` so it can be
-independently verified or used as a starting point to add more. Extending scope
-(structures/withdrawals, meteorology, kinetics rates, output control, ...) is future work.
+1,100 more checks from the reference preprocessor (gates, meteorology, kinetics rate
+coefficients, output control, and the grid-elevation-dependent checks noted above) are
+not ported yet. Each check in `review_config.jl` cites its source line range in
+`pre_ivf_422.f90` so it can be independently verified or used as a starting point to add
+more.
 
 ---
 

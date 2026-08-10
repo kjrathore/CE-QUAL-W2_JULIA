@@ -267,36 +267,55 @@ end
     emit_vertical_fields!(io, indent, rows, data, raw_unclassified)
 
 Emits one field per row (key from column B via `split_label`, value(s) from
-column C onward) -- EXCEPT when consecutive rows share the same extracted
-key (e.g. 5 macrophyte-group placeholder rows all labeled "MAC Waterbody
-macrophyte <n> computations..." -- the workbook describes the group number
-in free text rather than a MAC1/MAC2-style suffix, so `split_label` alone
-can't tell them apart). Those runs are merged into one array field instead
-of being silently overwritten under a duplicate YAML key.
+column C onward) -- EXCEPT when two or more rows in the block share the same
+extracted key, which happens for two distinct reasons in the real workbook,
+neither of which is adjacency-guaranteed:
+
+  1. Consecutive runs: e.g. 5 macrophyte-group placeholder rows all labeled
+     "MAC Waterbody macrophyte <n> computations..." -- the workbook describes
+     the group number in free text rather than a MAC1/MAC2-style suffix, so
+     `split_label` alone can't tell them apart.
+  2. Non-adjacent genuine duplicate labels: e.g. SPILLWAYS' upstream and
+     downstream SPECIFY-elevation fields are BOTH labeled "ETUSP-Top
+     elevation..." in the source workbook (row 201 and row 206) -- the
+     downstream one should logically be "ETDSP" to match the KTDSP/KBDSP
+     pattern used two rows later, but the workbook itself has the typo, not
+     just our extraction. Same pattern for EBUSP, and for CGS ("Settling
+     rate" and "Gas transfer saturation concentration" in the GENERIC
+     CONSTITUENT block both reduce to key CGS, with two unrelated fields --
+     CGLDK, CGKLF -- sitting between them).
+
+Grouping by key while preserving first-occurrence order (rather than only
+merging adjacent rows) catches both cases in one pass, and is safe because a
+key legitimately repeating within one block never happens except from a
+workbook labeling quirk -- confirmed by inspecting every known case, not
+assumed.
 """
 function emit_vertical_fields!(io, indent, rows, data, raw_unclassified)
-    parsed = Tuple{String,String,Vector}[]
+    order = String[]
+    grouped = Dict{String,Tuple{String,Vector}}()   # key -> (comment, values)
+
     for row in rows
         fb = data[row, 2]
         frest = trimmed(data[row, 3:end])
-        if fb isa AbstractString
-            key, comment = split_label(fb)
-            push!(parsed, (key, comment, isempty(frest) ? Any[missing] : frest))
-        else
+        if !(fb isa AbstractString)
             push!(raw_unclassified, (row, trimmed(data[row, 2:end])))
+            continue
+        end
+        key, comment = split_label(fb)
+        vals = isempty(frest) ? Any[missing] : frest
+        if haskey(grouped, key)
+            prev_comment, prev_vals = grouped[key]
+            grouped[key] = (prev_comment, vcat(prev_vals, vals))
+        else
+            push!(order, key)
+            grouped[key] = (comment, vals)
         end
     end
 
-    i = 1
-    while i <= length(parsed)
-        key, comment, vals = parsed[i]
-        j = i + 1
-        while j <= length(parsed) && parsed[j][1] == key
-            vals = vcat(vals, parsed[j][3])
-            j += 1
-        end
+    for key in order
+        comment, vals = grouped[key]
         emit_field!(io, indent, key, vals, comment)
-        i = j
     end
 end
 
