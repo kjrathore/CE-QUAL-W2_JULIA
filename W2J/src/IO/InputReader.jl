@@ -11,13 +11,18 @@
 #   3. Time/stability control block (TMSTRT..DLTADD)
 #   4. Grid definition block (US/DS/UHS/DHS/NL/SLOPE/SLOPEC per branch,
 #      LAT/LONGIT/ELBOT/BS/BE/JBDN per waterbody)
+#   5. Initial condition block, per waterbody (T2I/ICEI/WTYPEC/GRIDC,
+#      input.F90:703) -- added when porting the density equation of state
+#      (Hydrodynamics/Density.jl), which needs WTYPEC to derive FRESH_WATER/
+#      SALT_WATER, and resolves the TRAPEZOIDAL(JW) assumption flagged in
+#      Core/InitGeometry.jl.
 #
 # NOT YET IN SCOPE (deferred to Tier 1, see project notes):
-#   Initial conditions, meteorology cards, ice, turbulence-closure control,
-#   inflow/outflow cards, structures, withdrawals, the full constituent (CST)
-#   block, output control cards, kinetics rate constants. These all sit
-#   POSITIONALLY between grid definition and the bathymetry filename (BTHFN)
-#   in w2_con.csv -- there is no way to "skip past" them without knowing each
+#   Meteorology cards, ice, turbulence-closure control, inflow/outflow cards,
+#   structures, withdrawals, the full constituent (CST) block, output control
+#   cards, kinetics rate constants. These all sit POSITIONALLY between the
+#   initial condition block and the bathymetry filename (BTHFN) in
+#   w2_con.csv -- there is no way to "skip past" them without knowing each
 #   section's exact row count, which is exactly the Tier 1 parsing work.
 #
 # CONSEQUENCE: BTHFN (the bathymetry filename) is NOT read from w2_con.csv
@@ -51,15 +56,16 @@ Fortran ALLOCATE step in input.F90 that follows the dimension read -- must be
 called after `read_control_file` (needs `g.IMX`/`g.KMX`) and before
 `read_bathymetry!`.
 
-Only allocates the fields BathymetryReader currently populates (DLX, ELWS,
-B). Other W2Geometry fields (H, H1, H2, BH1, ...) stay zero-length until a
-caller actually needs them -- see the H(K,JW) shape mismatch note in
-Core/State.jl before sizing H.
+Only allocates the fields BathymetryReader currently populates (DLX, ELWS, B,
+H). Other W2Geometry fields (H1, H2, BH1, ...) stay zero-length until
+Core/InitGeometry.jl's `allocate_init_geometry!` sizes them -- see that
+file's module docstring for the resolved H(K,JW) shape decision.
 """
 function allocate_geometry!(g::W2Global, geom::W2Geometry)
     geom.DLX  = zeros(Float64, g.IMX)
     geom.ELWS = zeros(Float64, g.IMX)
     geom.B    = zeros(Float64, g.KMX, g.IMX)
+    geom.H    = zeros(Float64, g.KMX, g.IMX)
     return geom
 end
 
@@ -273,7 +279,16 @@ function read_control_file(path::AbstractString; debug::Bool=true)
     g.JBDN = parse.(Int, read_list!(c, g.NWB))
 
     debug && @info "InputReader: waterbody definition" geom.LAT geom.LONGIT geom.ELBOT g.BS g.BE g.JBDN
-    debug && @info "InputReader: stopped after grid/waterbody definition, row $(c.pos) of $(length(c.rows)) -- BTHFN not yet reached (see module docstring)"
+
+    # --- Initial condition block, per waterbody (input.F90 line 703) ---
+    skip!(c, 1); expect_row!(c, ["WB1"])   # generic per-waterbody marker
+    geom.T2I    = parse.(Float64, read_list!(c, g.NWB))
+    geom.ICEI   = parse.(Float64, read_list!(c, g.NWB))
+    geom.WTYPEC = strip.(read_list!(c, g.NWB))
+    geom.GRIDC  = strip.(read_list!(c, g.NWB))
+
+    debug && @info "InputReader: initial conditions" geom.T2I geom.ICEI geom.WTYPEC geom.GRIDC
+    debug && @info "InputReader: stopped after initial condition block, row $(c.pos) of $(length(c.rows)) -- BTHFN not yet reached (see module docstring)"
 
     return g, geom, tc
 end

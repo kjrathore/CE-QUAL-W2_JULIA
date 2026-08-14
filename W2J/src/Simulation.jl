@@ -1,35 +1,62 @@
+# ==============================================================================
+# Simulation.jl
+#
+# First-cut time-stepping driver, tying together Core/InitGeometry.jl,
+# Hydrodynamics/FreeSurface.jl, and IO/OutputWriter.jl into a runnable
+# end-to-end simulation. See CLAUDE.md "MVP hydrodynamic run" steps 5-7 --
+# this is the "zero-flow sanity check" scope confirmed with the user
+# (2026-08-12): no inflow/outflow, reduced physics (see
+# Hydrodynamics/FreeSurface.jl module docstring for exactly what's real vs.
+# stubbed), goal is a stable free-surface over many timesteps with real TSR
+# CSV output, not a faithful port of `w2_4_win.f90`'s full driver.
+#
+# NOT PORTED (flagged, not guessed away):
+# - The real adaptive timestep machinery (DLTF/DLTMIN/DLTD breakpoints,
+#   stability-based DLT selection, `w2_4_win.f90`'s `AUTO_STEPPING`) -- this
+#   driver uses one FIXED `dlt = tc.DLTMAX[1]` for every step. Correct for a
+#   reduced-physics zero-flow run (nothing destabilizes the timestep), wrong
+#   once real forcing (structures, meteorology, non-uniform density) is
+#   added -- port real DLT selection before trusting a non-sanity-check run.
+# - Any boundary condition IO (inflow/outflow/withdrawal/tributary time
+#   series) -- Tier 1, not built (CLAUDE.md "Open questions" / MVP step 8).
+#   `g.QSS`/`g.UXBR`/`g.UYBR` stay at their allocated zero forever in this
+#   driver.
+# - Kinetics / constituent transport (WaterQuality/*, Hydrodynamics/
+#   Transport.jl) -- both still stubs, not called here.
+# ==============================================================================
+
 """
-Simulation driver — the walking-skeleton orchestration loop.
+    run_zero_flow_sanity_check!(g, geom, net, tc; nsteps, output_dir, output_segments, base_name="tsr")
 
-Originating Fortran context: w2_4_win.f90 — the main driver (33 distinct
-callees, confirmed orchestrator of nearly every subsystem). Tier 3 —
-ported LAST in the original-file sense, but its *replacement skeleton*
-(this file) is conceptually part of the foundation, alongside Core/State.jl
-and Solvers/Tridiagonal.jl — see README "Base Module / Walking-Skeleton
-Plan".
+Runs `nsteps` fixed-`dlt` reduced-physics hydrodynamic steps
+(`hydrodynamic_step!`) starting from the current state of `g`/`geom`
+(already passed through `init_geometry!`, `compute_dlxrho!`, and
+`allocate_hydro_state!` by the caller), writing one TSR CSV row per step
+(plus the initial condition) for each segment in `output_segments` via
+`OutputWriter`.
 
-The intended minimal end-to-end loop, once each piece below has even a
-stub/simplified implementation:
+`dlt` is fixed at `tc.DLTMAX[1]` for the whole run -- see module docstring
+for why the real adaptive-timestep logic isn't ported yet. `output_segments`
+is caller-supplied on purpose (not derived from Detroit-specific structure
+here) -- keeps this function usable for any waterbody/branch topology.
 
-    read input -> init geometry -> timestep loop {
-        hydrodynamics!   (Waterbody, Transport, Turbulence, Structures)
-        kinetics!        (RateMultipliers, then Constituents)
-        output!
-    }
-
-First validation target (see README Open Questions): a single unbranched
-reservoir, no withdrawal structures, temperature + 1-2 constituents only,
-run end-to-end and compared against the existing Fortran executable's
-output for the same case. Nothing below should be considered "working"
-until that comparison passes.
+Returns `(g, geom, jday_final)`.
 """
+function run_zero_flow_sanity_check!(g, geom, net, tc; nsteps::Int, output_dir::AbstractString,
+                                      output_segments::Vector{Int}, base_name::AbstractString="tsr")
+    dlt = tc.DLTMAX[1]
+    jday = tc.TMSTRT
 
-# function run_simulation(input_path; arch::AbstractArchitecture = CPU())
-#     # 1. IO.InputReader — read control file
-#     # 2. Core.Grid — build geometry / branch network
-#     # 3. Core.State — allocate HydrodynamicState, ConstituentState, RateMultipliers
-#     # 4. timestep loop:
-#     #      Hydrodynamics.transport!(...), Hydrodynamics.calculate_tke!(...), ...
-#     #      WaterQuality.rate_multipliers!(...) then WaterQuality kinetics
-#     #      IO.OutputWriter — write outputs on schedule
-# end
+    writer = OutputWriter.open_tsr_files(output_dir, base_name, output_segments)
+    try
+        OutputWriter.write_tsr_row!(writer, g, geom, jday, dlt)  # initial condition
+        for _ in 1:nsteps
+            hydrodynamic_step!(g, geom, net, dlt)
+            jday += dlt / 86400.0
+            OutputWriter.write_tsr_row!(writer, g, geom, jday, dlt)
+        end
+    finally
+        OutputWriter.close_tsr_files!(writer)
+    end
+    return (g, geom, jday)
+end

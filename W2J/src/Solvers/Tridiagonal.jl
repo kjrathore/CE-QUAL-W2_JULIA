@@ -27,9 +27,13 @@ since a single Thomas elimination has a genuine sequential dependency);
 the parallelism comes from calling this independently across many
 columns at once (see `solve_vertical_systems!` below).
 
-TODO: validate numerically against TRIDIAG's exact output for a single
-column, using a known az.f90/w2_4_win.f90 input case, before wiring into
-any larger module.
+VALIDATED (test/runtests.jl, "Solvers/Tridiagonal: thomas_solve!"): cross-
+checked against Julia's dense `\\` solver and against a literal transcription
+of `TRIDIAG` (transport.f90:572-593) over 200 randomized diagonally-dominant
+systems, plus one hand-verified fixed case. The two recurrences are
+algebraically equivalent (this one normalizes incrementally; TRIDIAG keeps
+values unnormalized until the final back-substitution division) — confirmed
+by direct comparison, not just by inspection.
 """
 function thomas_solve!(a::AbstractVector, b::AbstractVector, c::AbstractVector,
                         d::AbstractVector, x::AbstractVector)

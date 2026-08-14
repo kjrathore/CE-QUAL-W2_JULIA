@@ -150,16 +150,20 @@ function read_bathymetry!(geom, g, path::AbstractString, jw::Int; debug::Bool=tr
     geom.ELWS[seg_range] .= ELWS
     geom.B[:, seg_range] .= B
 
-    # PHI0, FRIC, and H(K,JW) don't have a struct field yet:
-    #  - PHI0, FRIC are GLOBAL-module, per-segment (IMX) in the Fortran source
-    #    -- not yet added to W2Global, since nothing else has needed them.
-    #  - H(K,JW) is per-waterbody (KMX x NWB), and W2Geometry's H/H1/H2 fields
-    #    are currently typed as per-segment (KMX x IMX) -- a real mismatch,
-    #    not just a missing field. Needs a deliberate decision, not a quick
-    #    patch, so it's returned directly instead of forced into the wrong
-    #    shape.
-    # Returning all four below so nothing is silently dropped; add the struct
-    # fields once a second caller actually needs them persisted.
+    # H(K,JW) RESOLVED (see CLAUDE.md "Open questions" / Core/InitGeometry.jl
+    # module docstring): W2Geometry.H is KMX x IMX like every other geometry
+    # array (B, EL, ...), not KMX x NWB like the raw Fortran declaration.
+    # Broadcasting this waterbody's H down every one of its segments makes
+    # `geom.H[k, i]` valid for any segment i in this waterbody -- callers
+    # never need a separate per-waterbody lookup, at the cost of a small
+    # amount of redundant storage (H is constant across a waterbody's
+    # segments by construction, both in Fortran and here).
+    geom.H[:, seg_range] .= repeat(H, 1, n_seg)
+
+    # PHI0, FRIC don't have a struct field yet -- GLOBAL-module, per-segment
+    # (IMX) in the Fortran source, not yet added to W2Global since nothing
+    # else has needed them. Returned directly so nothing is silently dropped;
+    # add the struct fields once a second caller actually needs them persisted.
 
     debug && @info "BathymetryReader: read DLX[1:3]=$(DLX[1:min(3,end)]) H[1:3]=$(H[1:min(3,end)])"
 

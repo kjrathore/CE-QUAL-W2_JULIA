@@ -5,11 +5,15 @@ discussed in the project research notes (`README.md` at the project root — the
 analysis, Fortran call-graph audit, ENTRY-decomposition findings, and decision log live
 there; this file is about the Julia codebase itself).
 
-**Status: 🚧 architecture scaffolding + IO base module. No physics implemented yet.**
-`Pkg.instantiate()` / `Pkg.test()` now runtime-verified against Julia 1.11.3 — the
-IO/geometry base stack (`InputReader` → `allocate_geometry!` → `BathymetryReader` →
-`LongitudinalProfile`) runs end-to-end against real Detroit Reservoir data (11/11 tests
-passing, see Progress Tracker).
+**Status: 🚧 first-cut reduced-physics hydrodynamic run working end-to-end.**
+`Pkg.instantiate()` / `Pkg.test()` runtime-verified against Julia 1.11.3 (481/481 tests
+passing). The IO/geometry base stack (`InputReader` → `allocate_geometry!` →
+`BathymetryReader` → `init_geometry!`) AND a reduced-physics free-surface/momentum
+solve (`Hydrodynamics/FreeSurface.jl`) AND a time-stepping driver
+(`Simulation.run_zero_flow_sanity_check!`) all run end-to-end against real Detroit
+Reservoir data, producing real per-segment TSR CSV output (`IO/OutputWriter.jl`) that
+shows a stable water surface under a zero-boundary-flow sanity check — see Progress
+Tracker. Parallel processing is the explicitly-agreed next phase, not yet started.
 
 ---
 
@@ -49,11 +53,14 @@ W2J/
 │   ├── W2J.jl                          — module entry point
 │   ├── Core/
 │   │   ├── Architecture.jl             — CPU/GPU dispatch type (implemented)
-│   │   ├── State.jl                    — shared-state struct design (skeleton)
-│   │   └── Grid.jl                     — branch-network topology (skeleton)
+│   │   ├── State.jl                    — shared-state struct design (IMPLEMENTED — 130/50 fields, W2Global/W2Geometry)
+│   │   ├── Grid.jl                     — branch-network topology (IMPLEMENTED + validated — see status table)
+│   │   └── InitGeometry.jl             — geometry finalization: EL/KB/KTI/VOL/... (IMPLEMENTED — see status table)
 │   ├── Solvers/
-│   │   └── Tridiagonal.jl              — per-column Thomas algorithm (IMPLEMENTED — see status table)
+│   │   └── Tridiagonal.jl              — per-column Thomas algorithm (IMPLEMENTED + VALIDATED — see status table)
 │   ├── Hydrodynamics/
+│   │   ├── Density.jl                  — water density equation of state (IMPLEMENTED + validated)
+│   │   ├── FreeSurface.jl              — free-surface elevation + momentum solve (IMPLEMENTED, REDUCED PHYSICS — see status table)
 │   │   ├── Waterbody.jl                — branch/segment boundary conditions (stub)
 │   │   ├── Transport.jl                — advection-diffusion (stub)
 │   │   ├── Turbulence.jl                — TKE closure (stub)
@@ -67,9 +74,10 @@ W2J/
 │   │       ├── Algae.jl
 │   │       └── Sediment.jl
 │   ├── IO/
-│   │   ├── InputReader.jl              — stub
-│   │   └── OutputWriter.jl             — stub
-│   └── Simulation.jl                   — driver loop / walking-skeleton orchestrator (stub)
+│   │   ├── InputReader.jl              — IMPLEMENTED + validated (Phase A + allocate_geometry!)
+│   │   ├── BathymetryReader.jl         — IMPLEMENTED + validated against real bth1.csv
+│   │   └── OutputWriter.jl             — IMPLEMENTED, first-cut TSR CSV writer (reduced columns — see status table)
+│   └── Simulation.jl                   — IMPLEMENTED, first-cut fixed-DLT zero-flow driver (see status table)
 ├── test/
 │   ├── runtests.jl
 │   └── reference_cases/                — empty; needs a Fortran reference run to compare against
@@ -87,20 +95,23 @@ W2J/
 
 | W2J module | Originating Fortran file(s) | Porting tier | Status |
 |---|---|---|---|
-| `Core/State.jl` | `w2modules.F90` | Foundation | Skeleton |
-| `Core/Grid.jl` | `waterbody.f90` (branch connectivity entries) | Foundation | Skeleton |
-| `Solvers/Tridiagonal.jl` | `TRIDIAG` (called from `az.f90`, `w2_4_win.f90`) | Foundation | **Implemented, unvalidated** |
+| `Core/State.jl` | `w2modules.F90` | Foundation | **Implemented** (grown as later modules need fields) |
+| `Core/Grid.jl` | `waterbody.f90:36-42` (branch-linkage lookup pattern, not the full ENTRY points) | Foundation | **Implemented + validated** against real Detroit topology |
+| `Core/InitGeometry.jl` | `init-geom.F90` + `init.F90:205-249,415-418` | Foundation | **Implemented + validated** against real Detroit data (see below) |
+| `Solvers/Tridiagonal.jl` | `TRIDIAG` (called from `az.f90`, `w2_4_win.f90`) | Foundation | **Implemented + validated** (200 randomized cases + 1 fixed case, cross-checked against a literal `TRIDIAG` transcription and Julia's dense solver) |
+| `Hydrodynamics/Density.jl` | `density.f90` | Foundation | **Implemented + validated** against known physical reference values |
+| `Hydrodynamics/FreeSurface.jl` | `w2_4_win.f90` (free-surface/momentum block, :879-1327) | Foundation | **Implemented, REDUCED PHYSICS, validated** — see "What's Actually Implemented" below |
 | `Hydrodynamics/Waterbody.jl` | `waterbody.f90` | Tier 0 | Stub |
 | `Hydrodynamics/Transport.jl` | `transport.f90` | Tier 0 | Stub |
 | `Hydrodynamics/Turbulence.jl` | `az.f90` | Tier 2 | Stub |
 | `Hydrodynamics/Structures.jl` | `gate-spill-pipe.f90`, `withdrawal.f90` | Tier 1 | Stub |
 | `WaterQuality/RateMultipliers.jl` | `water-quality.f90` (`TEMPERATURE_RATES` entry) | Tier 1 | Skeleton, formulas confirmed |
 | `WaterQuality/Kinetics.jl` + `Constituents/` | `water-quality.f90` (~70 entries) | Tier 1 | Stub |
-| `IO/InputReader.jl` | `input.F90` | Tier 2 | **Implemented + validated (Phase A + `allocate_geometry!`)** |
+| `IO/InputReader.jl` | `input.F90` | Tier 2 | **Implemented + validated** (Phase A + `allocate_geometry!` + initial-condition block: `T2I`/`ICEI`/`WTYPEC`/`GRIDC`) |
 | `IO/BathymetryReader.jl` | `input.F90` (bathymetry read, `$`-format) | Tier 2 | **Implemented + validated** against real `bth1.csv` |
 | `Plotting/LongitudinalProfile.jl` | n/a (debugging tool) | — | **Implemented + runtime-verified** end-to-end against Detroit data |
-| `IO/OutputWriter.jl` | `output.f90`, `outputa2w2tools.F90`, `outputinitw2tools.F90` | — | Stub |
-| `Simulation.jl` | `w2_4_win.f90` | Tier 3 (file) / Foundation (skeleton role) | Stub |
+| `IO/OutputWriter.jl` | `output.f90`, `outputa2w2tools.F90`, `outputinitw2tools.F90` | — | **Implemented, first-cut** — per-segment TSR CSV, reduced columns (JDAY/DLT/ELWS/U only — see below) |
+| `Simulation.jl` | `w2_4_win.f90` | Tier 3 (file) / Foundation (skeleton role) | **Implemented, first-cut** — fixed-DLT zero-flow driver (`run_zero_flow_sanity_check!`), see below |
 
 ---
 
@@ -109,8 +120,112 @@ W2J/
 Be precise about this so nothing gets mistaken for working code:
 
 - **`Solvers/Tridiagonal.jl`** — real Thomas algorithm + threaded batch dispatch, written
-  out fully. **Not yet validated** against `TRIDIAG`'s actual output for a known input —
-  do that before relying on it.
+  out fully and **validated**: cross-checked against Julia's dense `\` solver AND a
+  literal transcription of the real `TRIDIAG` subroutine (transport.f90:572-593) over
+  200 randomized diagonally-dominant systems plus one hand-verified fixed case (see
+  `test/runtests.jl`).
+- **`Core/InitGeometry.jl`** — ports `init-geom.F90` (641 lines): layer elevations
+  `EL(K,I)`, top/bottom active layers `KTI`/`KTWB`/`KB`, cell volumes/depths/areas, and
+  the branch boundary-condition flags it depends on from `init.F90`. **Validated**
+  against real Detroit data: `EL[KMX,:] == ELBOT`, `KB` matches the documented range,
+  volumes are finite and non-negative, and the model's own "upstream active segment"
+  logic (`CUS`) correctly detects that branch 1's segments 2-5 are dry at the Jan-1
+  drawdown pool while segments 6-11 near the dam stay wet -- a real, physically-sensible
+  edge case this session initially mistook for a bug before checking directly (see
+  `Core/InitGeometry.jl`'s module docstring for the full deferral list: RESTART_IN,
+  TRAPEZOIDAL grids, `w2_constriction.csv`, and -- the one real accuracy gap, not just a
+  skip -- an **approximated** cross-branch boundary-width interpolation that copies the
+  adjacent branch's column instead of the real elevation-matched interpolation).
+  This also resolves the `H(K,JW)` shape question flagged in `CLAUDE.md`: `geom.H` is
+  now populated as `KMX x IMX` (broadcast per waterbody across its segments), matching
+  every other geometry array, rather than the raw Fortran's `KMX x NWB`.
+- **`Core/Grid.jl`** — `BranchNetwork` + `build_branch_network`, a one-time
+  precomputation of the branch-to-branch/branch-to-waterbody connectivity lookup that
+  otherwise gets re-derived via `findfirst` at the top of nearly every `waterbody.f90`
+  ENTRY point (confirmed by reading `UPSTREAM_VELOCITY`, `waterbody.f90:36-42` -- the
+  same "find JJB, then find JJW" pattern). `Core/InitGeometry.jl`'s
+  `compute_bottom_layers!` was refactored to use it instead of its own inline copy of
+  the same search. **Validated** against real Detroit topology: branches 2-4 correctly
+  resolve to branch 1 as their downstream connection at segments 9/10/11, branch 1
+  correctly resolves to no downstream branch (external, at the dam), and no branch has
+  an internal upstream connection (`UHS` all 0 for Detroit). Scope note: this file owns
+  the *static* topology query only -- the actual per-timestep boundary-value
+  interpolation those `waterbody.f90` ENTRY points do (velocity/elevation/constituent
+  profiles across a junction) is `Hydrodynamics/Waterbody.jl`'s job, still a stub.
+  ALSO added `branch_processing_order` -- a Kahn's-algorithm topological sort answering
+  the "Free-surface elevation solve" open question in `CLAUDE.md`: tracing
+  `w2_4_win.f90:896-1050` confirmed the free-surface solve is sequential across
+  connected branches (branch JB's tridiagonal boundary term pulls `Z(UHS(JB))`/
+  `Z(DHS(JB))` from a *different*, already-solved branch within the same timestep),
+  not parallel like the TKE/momentum `TRIDIAG`. **Validated for generality, not just
+  Detroit**: Detroit's branches happen to already be numbered downstream-to-upstream,
+  so matching `[1,2,3,4]` alone wouldn't prove the algorithm is doing real topological
+  work rather than just returning stored order -- also tested against a synthetic
+  *reversed*-numbering topology (branch 4 is the true downstream/terminal branch;
+  branches 1-3 all connect into it) and confirmed branch 4 is still correctly ordered
+  first despite its highest number (see `test/runtests.jl`).
+- **`Hydrodynamics/Density.jl`** — `density()`, the water equation of state (`density.f90`,
+  a clean self-contained 27-line function, chosen as the next concrete step after tracing
+  showed the free-surface+momentum solve itself isn't separable -- see `CLAUDE.md` "MVP
+  hydrodynamic run"). Ported with EXPLICIT `fresh_water`/`salt_water`/`susp_solids`
+  boolean arguments instead of the real Fortran's implicit `USE GLOBAL, ONLY:JW` shared-
+  state read (Decision Log #4). **Validated** against known physical reference points, not
+  just internal consistency: fresh water's density maximum at 4 degC (~999.97 kg/m^3),
+  and values at 0/20/25 degC, all matching standard textbook figures to 3 decimal places.
+  Getting the real `FRESH_WATER(JW)`/`SALT_WATER(JW)` flags right required tracing one
+  level deeper than expected: they depend on `WTYPEC` (now read by `InputReader.jl`'s new
+  initial-condition block) AND the global `CONSTITUENTS` flag (from `CCC`) AND
+  `CAC(NTDS)` (is TDS itself active) -- both Tier 1, not read into structs yet. Rather
+  than default those two to `true` (which would silently diverge from the real model for
+  any control file with water quality off or TDS untracked), `Core/InitGeometry.jl`'s
+  `compute_water_type_flags!` takes them as REQUIRED explicit keyword arguments, and is
+  deliberately NOT called automatically by `init_geometry!` for that reason.
+  Also (same investigation): `Core/InitGeometry.jl`'s previously-assumed-false
+  `TRAPEZOIDAL(JW)` is now read for real (`GRIDC`, no Tier-1 dependency, unlike
+  `FRESH_WATER`/`SALT_WATER`) and `compute_areas_volumes!` now ERRORS loudly (proven by a
+  test that flips Detroit's own real, non-TRAP flag to force the guard to fire) instead of
+  silently computing wrong RECT-formula areas for a TRAP-gridded waterbody.
+- **`Hydrodynamics/FreeSurface.jl`** — traced directly from `w2_4_win.f90` (an
+  `INTEGER FUNCTION`, not a separable `SUBROUTINE` like `init-geom.F90`), confirming the
+  free-surface elevation solve is genuinely sequential across connected branches (see
+  `Core/Grid.jl`'s `branch_processing_order` above). Confirmed with the user
+  (2026-08-12) as **REDUCED PHYSICS BY DELIBERATE CHOICE**, not a faithful full port:
+  REAL formulas for density (`RHO`), hydrostatic pressure (`P`), gravity/channel-slope
+  (`GRAV`), the horizontal pressure gradient (`HPG`, though HDG/HPG are merged into one
+  computation rather than kept as the two separate old/new-geometry passes the real
+  source uses), the implicit free-surface tridiagonal solve itself (including real
+  branch-to-branch sequencing and `DH_INTERNAL`/`UH_INTERNAL` boundary coupling), and
+  the explicit velocity update. STUBBED AND FLAGGED (not silently omitted): bottom/wind
+  shear (`SB`/`ST`, needs `Turbulence.jl` + meteorology IO), advection/dispersion of
+  momentum (`ADMX`/`ADMZ`/`DM`, real formulas exist but are 0 whenever `U=0` anyway —
+  port before trusting nonzero-inflow runs), the dam-flow/reciprocal-head-flow branch
+  case (unreachable for Detroit), and the implicit vertical-eddy-viscosity correction
+  step (needs `Turbulence.jl`). **Validated**: a real bug was found and fixed along the
+  way — `input.F90:2265,2275`'s `H2(:,I) = H(:,JW)` baseline copy (every layer, not just
+  the top active layer) was never ported into `BathymetryReader.jl`, leaving `geom.H2`
+  zero below the top layer and causing `0.0/0.0` NaNs in the velocity update; fixed in
+  `Core/InitGeometry.jl`'s `allocate_init_geometry!` (`geom.H2 = copy(geom.H)`, since
+  `geom.H` is already populated by the time that function runs). This also revealed the
+  earlier `VOL` test was too weak (finite-and-non-negative passes trivially for
+  all-zero) — strengthened to assert nonzero volume below the top layer. Post-fix,
+  `test/runtests.jl`'s zero-flow sanity check confirms water surface elevation and
+  velocity stay bit-for-bit stable (`< 1e-9` drift) over 5 timesteps against real
+  Detroit data — a real test of the tridiagonal assembly and branch sequencing (a bug
+  in branch ordering or the `BHRHO`/`A`/`V`/`C` coefficients would show up as drift or
+  NaN), not a tautology.
+- **`Simulation.jl` / `IO/OutputWriter.jl`** — `run_zero_flow_sanity_check!` ties
+  `init_geometry!` → `hydrodynamic_step!` → per-step TSR CSV output into one runnable
+  driver. First-cut scope, matching `FreeSurface.jl`: ONE fixed `dlt = tc.DLTMAX[1]` for
+  the whole run (the real adaptive DLTF/DLTMIN/DLTD breakpoint machinery isn't ported —
+  fine for a reduced-physics zero-flow run, wrong once real forcing is added), no
+  boundary-condition IO (Tier 1, not built), no kinetics/constituent transport.
+  `OutputWriter.jl`'s TSR files follow the real per-segment naming convention
+  (`outputinitw2tools.F90:984-1057`, `<base>_seg<N>.csv`) but only emit the columns this
+  port actually computes (`JDAY,DLT(s),ELWS(m),U(ms-1)`) — `T2`/`Q`/`SRON`/`EXT`/etc are
+  real TSR columns, deliberately absent rather than written as fabricated zeros.
+  **Validated** end-to-end against real Detroit data (`test/runtests.jl`): runs 5 steps,
+  writes real CSVs for one representative segment per branch, confirms stable ELWS and
+  zero U in the written output itself (not just in-memory state).
 - **`WaterQuality/RateMultipliers.jl`** — formulas are direct transcriptions from the
   confirmed Fortran trace (not guessed), but the function itself is a stub because
   `LAM1`'s own derivation was never traced (flagged honestly in the file).
@@ -310,14 +425,65 @@ more.
       `$`-format row parser was calling `parse.(Float64, ...)` on the *whole*
       comma-split row (including trailing blank padding columns) before slicing to
       `n_seg`, instead of slicing first — blew up on every real Detroit row.
-- [ ] `thomas_solve!` validated against a known tridiagonal test case
+- [x] `thomas_solve!` validated against a known tridiagonal test case: cross-checked
+      against a literal transcription of the real `TRIDIAG` subroutine
+      (transport.f90:572-593) and Julia's dense solver, 200 randomized cases + 1 fixed
+      case (see `test/runtests.jl`)
+- [x] `init-geom.F90` ported (`Core/InitGeometry.jl`): `EL`/`KTI`/`KTWB`/`KB`/`VOL`/
+      `DEPTHB`/`DEPTHM`/areas, plus the `init.F90` boundary-condition flags and
+      `ALPHA`/`SINA`/`COSA` it depends on. Validated against real Detroit data. Resolves
+      the `H(K,JW)` shape question below. Known deferrals (RESTART_IN, trapezoidal
+      grids, `w2_constriction.csv`, JBTR/JBWD, and an **approximated** cross-branch
+      boundary-width interpolation) are documented in the file's module docstring --
+      see "What's Actually Implemented" above.
+- [x] `Core/Grid.jl` branch connectivity: `BranchNetwork` + `build_branch_network`,
+      validated against real Detroit topology, and `Core/InitGeometry.jl` refactored to
+      use it instead of its own duplicated lookup. Scope: static topology only --
+      `Hydrodynamics/Waterbody.jl` (the per-timestep boundary-value interpolation) is
+      still a stub, see "What's Actually Implemented" above.
+- [x] Free-surface elevation solve sequential-dependency question: RESOLVED, confirmed
+      sequential (not parallel like TKE/momentum). `Core/Grid.jl`'s
+      `branch_processing_order` computes the correct per-waterbody topological order for
+      any control file (validated against a synthetic reversed-numbering topology, not
+      just Detroit's already-convenient numbering) -- see "What's Actually Implemented".
+      The free-surface solve itself is not yet implemented (see Progress Tracker /
+      CLAUDE.md "MVP hydrodynamic run" for why it's not a single-file port like
+      `init-geom.F90` was, and the recommended decomposition).
+- [x] `Hydrodynamics/Density.jl` (`density()`, water equation of state) implemented +
+      validated against known physical reference values (4degC density maximum, 0/20/25
+      degC points). `InputReader.jl` extended to read the initial-condition block
+      (`T2I`/`ICEI`/`WTYPEC`/`GRIDC`); `Core/InitGeometry.jl`'s `TRAPEZOIDAL(JW)` now
+      read for real instead of assumed false, and `compute_areas_volumes!` errors loudly
+      (test-proven) rather than silently computing wrong areas for a TRAP grid.
+      `FRESH_WATER`/`SALT_WATER` require explicit `constituents`/`tds_active` args
+      (their real Fortran dependencies, not yet read into structs) rather than being
+      defaulted to `true` -- see "What's Actually Implemented" above.
+- [x] Free-surface + momentum solve implemented (`Hydrodynamics/FreeSurface.jl`),
+      REDUCED PHYSICS by deliberate choice (confirmed with user, 2026-08-12): real
+      density/pressure/gravity/pressure-gradient/tridiagonal-solve/branch-sequencing/
+      velocity-update; shear/advection/dispersion/dam-flow/vertical-eddy-viscosity
+      explicitly zeroed and flagged (need `Turbulence.jl` + meteorology IO, not built).
+      Found + fixed a real bug along the way: `input.F90:2265,2275`'s `H2(:,I)=H(:,JW)`
+      baseline copy was never ported, causing `0.0/0.0` NaNs in the velocity update --
+      fixed in `Core/InitGeometry.jl`. See "What's Actually Implemented" above.
+- [x] `Simulation.jl` first-cut driver (`run_zero_flow_sanity_check!`) + `IO/
+      OutputWriter.jl` first-cut TSR CSV writer implemented and validated end-to-end
+      against real Detroit data: 5-step zero-boundary-flow run produces real per-segment
+      TSR CSVs showing a stable water surface (`< 1e-9` drift) and zero velocity. Fixed
+      `dlt`, no boundary-condition IO, no kinetics -- see "What's Actually Implemented".
+      **This is the "first cut running and getting TSR outputs for Detroit" milestone
+      the user asked for (2026-08-13).** Parallel processing is the next agreed phase,
+      not yet started.
 - [ ] `LAM1` derivation traced; `RateMultipliers.jl` implemented for real
-- [ ] First walking-skeleton run (simplified physics, single unbranched reservoir)
+- [ ] Parallel processing (`Threads.@threads` over segments/cells) -- NEXT STEP, per
+      user's explicit "then next is to prepare for parallel processing" (2026-08-13)
+- [ ] Real adaptive timestep (DLTF/DLTMIN/DLTD breakpoints), boundary-condition IO
+      (Tier 1: inflow/outflow/withdrawal/tributary time series), and non-zero-flow
+      forcing (ADMX/ADMZ/DM, SB/ST via `Turbulence.jl` + meteorology) -- needed before
+      `Simulation.jl`/`FreeSurface.jl` can run anything beyond the zero-flow sanity check
 - [ ] First Fortran reference-output comparison
 - [ ] Cross-group kinetics coupling investigation resumed (paused mid-trace — see
       project research notes Open Questions, and the note in `Kinetics.jl`)
-- [ ] Free-surface elevation solve sequential-dependency check (separate from the
-      already-confirmed-parallel TKE/momentum solve)
 - [x] I/O reference mapping against v4.5 Excel doc: `tools/xlsx_to_yaml/convert.jl` reads
       the real `.xlsm` control-file workbook (the source of truth `w2_con.csv` is
       exported from) and emits a commented `w2_config.yaml`, validated against known

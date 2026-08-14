@@ -15,16 +15,22 @@ See README.md for architecture overview and the project research notes for
 the full Fortran call-graph audit and ENTRY-decomposition findings that this
 design is based on.
 
-Status: architecture scaffolding only. No physics implemented yet.
+Status: IO/geometry foundation implemented and validated against real Detroit
+Reservoir data (see W2J_README.md Progress Tracker). Hydrodynamic core (free-
+surface/momentum solve, transport, turbulence closure) not yet implemented;
+`density()` (Hydrodynamics/Density.jl) is the first piece of it.
 """
 module W2J
 
 include("Core/Architecture.jl")
 include("Core/State.jl")
 include("Core/Grid.jl")
+include("Core/InitGeometry.jl")
 
 include("Solvers/Tridiagonal.jl")
 
+include("Hydrodynamics/Density.jl")
+include("Hydrodynamics/FreeSurface.jl")
 include("Hydrodynamics/Waterbody.jl")
 include("Hydrodynamics/Transport.jl")
 include("Hydrodynamics/Turbulence.jl")

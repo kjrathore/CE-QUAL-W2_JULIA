@@ -88,6 +88,10 @@ mutable struct W2Global
     DLT::Float64; DLTMIN::Float64; DLTTVD::Float64; DZMAX::Float64
     BETABR::Float64; START::Float64; HMAX2::Float64; CURRENT::Float64
 
+    # --- init-geom.F90 / init.F90 scalars (min/max layer height, added when
+    # porting init_geometry! -- see Core/InitGeometry.jl) ---
+    HMIN::Float64; HMAX::Float64
+
     # --- per-segment / per-layer working arrays (TARGET, ALLOCATABLE in Fortran) ---
     T1::Matrix{Float64}; TSS::Matrix{Float64}
     C1::Array{Float64,3}; C2::Array{Float64,3}; C1S::Array{Float64,3}
@@ -104,6 +108,22 @@ mutable struct W2Global
     QUH1::Matrix{Float64}; QDH1::Matrix{Float64}
     UXBR::Matrix{Float64}; UYBR::Matrix{Float64}; VOL::Matrix{Float64}
 
+    # --- hydrodynamic solve state (w2modules.F90's "OPEN DESIGN NOTE" fields,
+    # previously deliberately omitted -- added now for Hydrodynamics/FreeSurface.jl.
+    # POINTER in Fortran for the T1/T2 old/new-step swap trick; not needed in
+    # Julia, see that design note above -- plain Matrix here). All KMX x IMX. ---
+    U::Matrix{Float64}       # horizontal velocity
+    RHO::Matrix{Float64}     # density, kg/m^3 (Hydrodynamics/Density.jl's density())
+    P::Matrix{Float64}       # hydrostatic pressure (w2_4_win.f90:1192-1196)
+    HPG::Matrix{Float64}     # horizontal pressure gradient
+    GRAV::Matrix{Float64}    # gravity term (channel slope)
+    SB::Matrix{Float64}      # bottom shear -- NOT YET COMPUTED, always 0 (needs friction/macrophyte terms)
+    ST::Matrix{Float64}      # wind/vertical shear -- NOT YET COMPUTED, always 0 (needs Turbulence.jl AZ + meteorology)
+    ADMX::Matrix{Float64}    # horizontal advection of momentum -- NOT YET COMPUTED, always 0
+    ADMZ::Matrix{Float64}    # vertical advection of momentum -- NOT YET COMPUTED, always 0
+    DM::Matrix{Float64}      # horizontal dispersion of momentum -- NOT YET COMPUTED, always 0
+    DLXRHO::Vector{Float64}  # per segment (IMX) -- static geometric factor, init.F90:735-739
+
     ALLIM::Array{Float64,3}; APLIM::Array{Float64,3}
     ANLIM::Array{Float64,3}; ASLIM::Array{Float64,3}; KFS::Array{Float64,3}
     ELLIM::Array{Float64,3}; EPLIM::Array{Float64,3}
@@ -117,9 +137,28 @@ mutable struct W2Global
     UHS::Vector{Int}; DHS::Vector{Int}; UQB::Vector{Int}; DQB::Vector{Int}
     OPT::Matrix{Int}
     NBODC::Vector{Int}; NBODN::Vector{Int}; NBODP::Vector{Int}
+    KBMAX::Vector{Int}   # per waterbody -- init-geom.F90:169 "KBMAX(JW) = MAX(KBMAX(JW),KB(I))"
 
     ICE::Vector{Bool}; ICE_CALC::Vector{Bool}; LAYERCHANGE::Vector{Bool}
     BR_INACTIVE::Vector{Bool}; BR_NOTECPLOT::Vector{Bool}
+
+    # --- branch boundary-condition flags (init.F90:205-249), per branch (NBR) ---
+    # Derived once from UHS/DHS/UQB/DQB right after the grid-definition block is
+    # read -- see Core/InitGeometry.jl's `compute_boundary_flags!`. Kept as
+    # separate Bool vectors (not combined into an enum) to match the Fortran
+    # source 1:1, since later modules (structures, transport) test them
+    # individually the same way the original does.
+    UP_FLOW::Vector{Bool}; DN_FLOW::Vector{Bool}
+    UP_HEAD::Vector{Bool}; DN_HEAD::Vector{Bool}
+    UH_INTERNAL::Vector{Bool}; DH_INTERNAL::Vector{Bool}
+    UH_EXTERNAL::Vector{Bool}; DH_EXTERNAL::Vector{Bool}
+    UQ_EXTERNAL::Vector{Bool}; DQ_EXTERNAL::Vector{Bool}
+    UQ_INTERNAL::Vector{Bool}; DQ_INTERNAL::Vector{Bool}
+    HEAD_FLOW::Vector{Bool}; INTERNAL_FLOW::Vector{Bool}
+    DAM_INFLOW::Vector{Bool}; DAM_OUTFLOW::Vector{Bool}
+
+    # --- per-waterbody flag: true unless any of its branches has SLOPE != 0 ---
+    ZERO_SLOPE::Vector{Bool}
 
     # --- misc ---
     RSIFN::String; MODDIR::String
@@ -142,6 +181,7 @@ function W2Global()
         0, 0, 0, 0, 0, 0, 0,                      # NEPT..NZOOE
         0.0, 0.0, 0.0, 100.0,                     # DLT..DZMAX (Fortran default DZMAX=1.0D2)
         0.0, 0.0, 0.0, 0.0,                       # BETABR..CURRENT
+        0.0, 0.0,                                 # HMIN, HMAX
         zeros(0, 0), zeros(0, 0),                 # T1, TSS
         zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0),
         zeros(0, 0, 0), zeros(0, 0, 0),
@@ -154,6 +194,9 @@ function W2Global()
         zeros(0, 0), zeros(0, 0), zeros(0, 0),
         zeros(0, 0), zeros(0, 0),
         zeros(0, 0), zeros(0, 0), zeros(0, 0),
+        zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0),   # U, RHO, P, HPG, GRAV
+        zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0),   # SB, ST, ADMX, ADMZ, DM
+        Float64[],                                                         # DLXRHO
         zeros(0, 0, 0), zeros(0, 0, 0),
         zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0),
         zeros(0, 0, 0), zeros(0, 0, 0),
@@ -165,8 +208,14 @@ function W2Global()
         Int[], Int[], Int[], Int[],
         zeros(Int, 0, 0),
         Int[], Int[], Int[],
+        Int[],                                    # KBMAX
         Bool[], Bool[], Bool[],
         Bool[], Bool[],
+        Bool[], Bool[], Bool[], Bool[],           # UP_FLOW, DN_FLOW, UP_HEAD, DN_HEAD
+        Bool[], Bool[], Bool[], Bool[],           # UH_INTERNAL, DH_INTERNAL, UH_EXTERNAL, DH_EXTERNAL
+        Bool[], Bool[], Bool[], Bool[],           # UQ_EXTERNAL, DQ_EXTERNAL, UQ_INTERNAL, DQ_INTERNAL
+        Bool[], Bool[], Bool[], Bool[],           # HEAD_FLOW, INTERNAL_FLOW, DAM_INFLOW, DAM_OUTFLOW
+        Bool[],                                   # ZERO_SLOPE
         "", "",
     )
 end
@@ -200,6 +249,7 @@ mutable struct W2Geometry
 
     DEPTHB::Matrix{Float64}; DEPTHM::Matrix{Float64}
     FETCHU::Matrix{Float64}; FETCHD::Matrix{Float64}
+    HSEG::Matrix{Float64}    # w2modules.F90:645 -- cumulative segment height from KB up to layer K
 
     Z::Vector{Float64}; ELWS::Vector{Float64}; SELWS::Vector{Float64}
     BCONSTRICTION::Vector{Float64}
@@ -207,6 +257,9 @@ mutable struct W2Geometry
     HTMP1::Float64; HTMP2::Float64   # scratch temporaries, kept for parity
 
     CONSTRICTION::Matrix{Bool}
+    ONE_LAYER::Vector{Bool}   # w2modules.F90:428 -- true where KT==KB(I) (single active layer)
+
+    KBI::Vector{Int}          # w2modules.F90:667 -- KB(I) snapshot before the one-layer adjustment
 
     # --- grid/waterbody definition block (w2_con.csv) ---
     # NOTE: LAT/LONGIT are declared in MODULE SURFHE in the Fortran source, not
@@ -216,6 +269,23 @@ mutable struct W2Geometry
     LAT::Vector{Float64}; LONGIT::Vector{Float64}     # per waterbody (NWB)
     ELBOT::Vector{Float64}                            # bottom elevation, per waterbody (NWB)
     NL::Vector{Int}                                   # number of layers, per branch (NBR)
+
+    # --- "INIT CND" block (w2_con.csv, right after waterbody definition),
+    # per waterbody (NWB). input.F90:703. Read by InputReader.jl. ---
+    T2I::Vector{Float64}      # initial temperature, oC
+    ICEI::Vector{Float64}     # initial ice thickness, m
+    WTYPEC::Vector{String}    # "FRESH" or "SALT"
+    GRIDC::Vector{String}     # "RECT" or "TRAP"
+
+    # --- derived from WTYPEC/GRIDC (init.F90:153,172,173), per waterbody
+    # (NWB). See Hydrodynamics/Density.jl's module docstring: FRESH_WATER/
+    # SALT_WATER genuinely depend on more than WTYPEC alone (also need the
+    # global CONSTITUENTS flag from CCC and CAC(NTDS), neither read by
+    # InputReader.jl yet -- Tier 1). Computed by
+    # `Core/InitGeometry.jl`'s `compute_water_type_flags!`, not at read time. ---
+    TRAPEZOIDAL::Vector{Bool}
+    FRESH_WATER::Vector{Bool}
+    SALT_WATER::Vector{Bool}
 end
 
 function W2Geometry()
@@ -232,13 +302,18 @@ function W2Geometry()
         zeros(0, 0),
         zeros(0, 0), zeros(0, 0), zeros(0, 0),
         zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0),
+        zeros(0, 0),                              # HSEG
         Float64[], Float64[], Float64[],
         Float64[],
         0.0, 0.0,
         zeros(Bool, 0, 0),
+        Bool[],                                   # ONE_LAYER
+        Int[],                                    # KBI
         Float64[], Float64[],
         Float64[],
         Int[],
+        Float64[], Float64[], String[], String[],   # T2I, ICEI, WTYPEC, GRIDC
+        Bool[], Bool[], Bool[],                     # TRAPEZOIDAL, FRESH_WATER, SALT_WATER
     )
 end
 
