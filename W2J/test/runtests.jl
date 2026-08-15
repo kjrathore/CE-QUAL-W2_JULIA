@@ -246,6 +246,57 @@ end
         @test maximum(abs, g.U[:, 2:30]) < 1e-9
     end
 
+    @testset "Hydrodynamics/FreeSurface: long-run stability (2000 steps)" begin
+        # The 5-step check above proves the tridiagonal assembly/branch
+        # sequencing is right at start-up; it does NOT prove the reduced-
+        # physics solve stays stable over a real simulation length. Detroit's
+        # own control file spans a full year (TMSTRT=1, TMEND=365) at
+        # DLTMAX=1200s -- ~26,208 steps. 2000 steps here (not the full
+        # 26,208) keeps the test suite fast while still covering two orders
+        # of magnitude more steps than the smoke-test-sized check above; a
+        # slow floating-point drift that only shows up after hundreds of
+        # steps (not 5) would be caught here.
+        detroit = joinpath(@__DIR__, "..", "..", "DetroitReservoir")
+        g, geom, tc = W2J.InputReader.read_control_file(joinpath(detroit, "w2_con.csv"); debug=false)
+        W2J.InputReader.allocate_geometry!(g, geom)
+        W2J.BathymetryReader.read_bathymetry!(geom, g, joinpath(detroit, "InputFiles", "bth1.csv"), 1; debug=false)
+        g, geom, net = W2J.init_geometry!(g, geom)
+        W2J.compute_dlxrho!(g, geom)
+        W2J.allocate_hydro_state!(g)
+
+        elws_before = copy(geom.ELWS)
+        dlt = tc.DLTMAX[1]
+        for _ in 1:2000
+            W2J.hydrodynamic_step!(g, geom, net, dlt)
+        end
+
+        @test all(isfinite, geom.ELWS[2:30])
+        @test all(isfinite, g.U[:, 2:30])
+        @test maximum(abs, geom.ELWS[2:30] .- elws_before[2:30]) < 1e-8
+        @test maximum(abs, g.U[:, 2:30]) < 1e-8
+    end
+
+    @testset "Core/Parallel: parallel_foreach" begin
+        # threshold=0 forces the Threads.@threads branch; threshold=typemax
+        # forces the serial branch -- both must visit every index exactly
+        # once and agree with each other, regardless of how many threads
+        # the test process actually has (correctness of the dispatch logic
+        # itself, not a timing test).
+        for range in (1:1, 1:10, 1:200)
+            hit_threaded = zeros(Int, length(range))
+            W2J.parallel_foreach(range; threshold=0) do i
+                hit_threaded[i - first(range) + 1] += 1
+            end
+            @test all(==(1), hit_threaded)
+
+            hit_serial = zeros(Int, length(range))
+            W2J.parallel_foreach(range; threshold=typemax(Int)) do i
+                hit_serial[i - first(range) + 1] += 1
+            end
+            @test hit_serial == hit_threaded
+        end
+    end
+
     @testset "Simulation: run_zero_flow_sanity_check! end-to-end TSR output" begin
         detroit = joinpath(@__DIR__, "..", "..", "DetroitReservoir")
         outdir = joinpath(detroit, "Outputs")
@@ -333,5 +384,40 @@ end
         @test findfirst(==(4), order2) < findfirst(==(1), order2)
         @test findfirst(==(4), order2) < findfirst(==(2), order2)
         @test findfirst(==(4), order2) < findfirst(==(3), order2)
+    end
+
+    @testset "Core/Grid: branch_processing_tiers (parallel-processing groundwork)" begin
+        detroit = joinpath(@__DIR__, "..", "..", "DetroitReservoir")
+        g, geom, tc = W2J.InputReader.read_control_file(joinpath(detroit, "w2_con.csv"); debug=false)
+        W2J.compute_boundary_flags!(g, geom)
+        net = W2J.build_branch_network(g)
+
+        # Branch 1 has no internal dependency -> tier 1 alone. Branches 2-4 each
+        # depend only on branch 1 (already resolved) -> tier 2 together, the
+        # concrete case this function exists for: three branches genuinely safe
+        # to process under Threads.@threads concurrently.
+        tiers = W2J.branch_processing_tiers(g, net, 1)
+        @test tiers == [[1], [2, 3, 4]]
+
+        # Flattening tiers must reproduce branch_processing_order exactly.
+        @test reduce(vcat, tiers) == W2J.branch_processing_order(g, net, 1)
+
+        # Synthetic reversed topology (same construction as the order test
+        # above): branch 4 is the true downstream/terminal branch; 1-3 all
+        # depend only on it -> tier 1 is [4] alone, tier 2 is [1,2,3] together.
+        g2 = W2J.W2Core.W2Global()
+        g2.NBR = 4; g2.NWB = 1; g2.IMX = 42
+        g2.US = [2, 12, 22, 32]; g2.DS = [10, 20, 30, 40]
+        g2.BS = [1]; g2.BE = [4]
+        g2.UHS = [0, 0, 0, 0]
+        g2.DHS = [32, 32, 32, 0]
+        g2.JBDN = [4]
+        geom2 = W2J.W2Core.W2Geometry()
+        geom2.SLOPE = zeros(4)
+        W2J.compute_boundary_flags!(g2, geom2)
+        net2 = W2J.build_branch_network(g2)
+
+        tiers2 = W2J.branch_processing_tiers(g2, net2, 1)
+        @test tiers2 == [[4], [1, 2, 3]]
     end
 end

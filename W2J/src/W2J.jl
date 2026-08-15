@@ -24,6 +24,7 @@ module W2J
 
 include("Core/Architecture.jl")
 include("Core/State.jl")
+include("Core/Parallel.jl")
 include("Core/Grid.jl")
 include("Core/InitGeometry.jl")
 

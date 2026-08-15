@@ -132,6 +132,38 @@ topological, so this is a real cross-check, not a tautology): branches
 so Kahn's algorithm must produce `[1,2,3,4]` -- see test/runtests.jl.
 """
 function branch_processing_order(g, net, jw)
+    return reduce(vcat, branch_processing_tiers(g, net, jw); init=Int[])
+end
+
+"""
+    branch_processing_tiers(g, net, jw) -> Vector{Vector{Int}}
+
+Same dependency graph and Kahn's-algorithm construction as
+`branch_processing_order` (see that docstring for the full derivation and
+the free-surface-solve sequential-dependency proof), but returns the
+round-by-round "ready" sets *without* flattening them into one order.
+
+Every branch within one tier (inner vector) depends only on branches in
+*earlier* tiers, never on another branch in the same tier -- by
+construction of Kahn's algorithm, a branch only enters the `ready` set once
+every dependency is already in a prior tier. This is the actual point of
+this function, for `Hydrodynamics/FreeSurface.jl`'s parallel-processing
+phase (CLAUDE.md "MVP hydrodynamic run", Pillar 1): branches in the same
+tier can run under `Threads.@threads` with no data race, since each
+branch's implicit tridiagonal solve only ever reads a *different* branch's
+state (`net.upstream_branch`/`net.downstream_branch`, both necessarily in
+an earlier tier) and only ever writes its own segment range plus its own
+one-segment boundary pad -- never another branch's.
+
+Sanity check against Detroit: branch 1 has no internal dependency
+(`net.downstream_branch[1] == 0`, external at the dam) so tier 1 is `[1]`;
+branches 2-4 each depend only on branch 1, so tier 2 is `[2,3,4]` -- three
+branches genuinely safe to process concurrently, not just a coincidence of
+Detroit's specific topology (see the reversed-numbering synthetic test in
+`test/runtests.jl` for the generality proof, same as
+`branch_processing_order`).
+"""
+function branch_processing_tiers(g, net, jw)
     branches = collect(g.BS[jw]:g.BE[jw])
     inset(jb) = jb in branches
 
@@ -145,15 +177,17 @@ function branch_processing_order(g, net, jw)
         depends_on[jb] = deps
     end
 
-    order = Int[]
+    tiers = Vector{Vector{Int}}()
+    resolved = Set{Int}()
     remaining = Set(branches)
     while !isempty(remaining)
-        ready = sort([jb for jb in remaining if all(d -> d in order, depends_on[jb])])
+        ready = sort([jb for jb in remaining if all(d -> d in resolved, depends_on[jb])])
         if isempty(ready)
-            error("branch_processing_order: cyclic or unresolvable branch dependency in waterbody $jw among $(sort(collect(remaining)))")
+            error("branch_processing_tiers: cyclic or unresolvable branch dependency in waterbody $jw among $(sort(collect(remaining)))")
         end
-        append!(order, ready)
+        push!(tiers, ready)
+        union!(resolved, ready)
         setdiff!(remaining, ready)
     end
-    return order
+    return tiers
 end

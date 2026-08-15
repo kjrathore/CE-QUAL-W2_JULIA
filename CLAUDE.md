@@ -267,17 +267,104 @@ into structs yet) — not just `WTYPEC` alone. Rather than default those two to 
 `compute_areas_volumes!` now erroring loudly (test-proven, not just asserted) instead of
 silently computing wrong RECT-formula areas for a TRAP-gridded waterbody.
 
-**Next concrete step (as of 2026-08-13)**: the free-surface + momentum solve, the
-first-cut `Simulation.jl` driver, and `IO/OutputWriter.jl`'s TSR CSV writer are all now
-implemented and validated (see step 4/7 above and `W2J_README.md` "What's Actually
-Implemented") — the "first cut running and getting TSR outputs for Detroit" milestone
-is done. Per the user's explicit follow-on instruction, **parallel processing is the
-next phase** (not yet started) — `Threads.@threads` over segments/cells, per the
-project's Pillar 1. Candidate first target: the per-column `thomas_solve!` calls inside
-`solve_free_surface!`'s branch loop are independent *within* a processing tier (branches
-with no same-tier dependency on each other can run concurrently; `branch_processing_order`
-already encodes the true dependency structure needed to find safe parallel tiers) — this
-needs a fresh trace/design pass, not an assumption, before implementing.
+**Parallel processing — DONE (first pass), 2026-08-14.** Per the user's explicit
+"then next is to prepare for parallel processing" instruction. Two changes:
+
+1. `Core/Grid.jl` gained `branch_processing_tiers(g, net, jw)` — the same Kahn's-
+   algorithm dependency graph `branch_processing_order` already used, but returning the
+   round-by-round "ready" sets *without* flattening them, so branches with no same-tier
+   dependency on each other are identifiable as a group. `branch_processing_order` is
+   now just `reduce(vcat, branch_processing_tiers(...))` — one graph construction, not
+   two. Validated (`test/runtests.jl`): Detroit's tiers are `[[1],[2,3,4]]` (branch 1 has
+   no internal dependency; branches 2-4 each depend only on branch 1) — three branches
+   genuinely safe to run concurrently, not a coincidence of Detroit's specific topology
+   (also validated against the existing synthetic reversed-numbering topology, tiers
+   `[[4],[1,2,3]]`).
+2. `Hydrodynamics/FreeSurface.jl`: `solve_free_surface!`'s per-branch body was pulled out
+   into `solve_branch_free_surface!` and is now called under `Threads.@threads for jb in
+   tier` for each tier from `branch_processing_tiers` — tiers still run strictly in
+   order (each tier's `Threads.@threads` loop is an implicit barrier), so a later tier's
+   cross-branch boundary read always sees the earlier tier's fully-updated `Z`/`ELWS`;
+   only branches *within* one tier run concurrently, which is safe because each only
+   reads a different (already-resolved, earlier-tier) branch's state and only ever
+   writes its own segment range plus its own boundary pad. `NWB` (waterbodies) is also
+   threaded — independent by construction (disjoint segment ranges). Every per-column
+   computation (`compute_density_field!`, `compute_pressure_field!`,
+   `compute_gravity_term!`, `compute_pressure_gradient!`, `update_velocities!`) is
+   threaded over segments `i` too — each column only ever writes its own data (a couple
+   read a neighbor column, none write one), confirmed embarrassingly parallel, matching
+   the project's own `TRIDIAG` case-A analysis (Pillar 1).
+
+**Validated, not just "should be correct"**: full test suite (484/484) passes at both
+`--threads=1` and `--threads=4`. Beyond that, ran `hydrodynamic_step!` for 20 timesteps
+against real Detroit data at both thread counts and confirmed **bit-identical** `ELWS`/
+`U` output (`441.090000000000089` etc., matching to the last printed digit) — proof
+there's no data race, not just that the looser sanity-check tests still pass.
+
+**Regression found + fixed same day: threading was actually SLOWER for Detroit.**
+User asked "have we tested the timestamps for parallel vs simple" — hadn't; only
+correctness had been checked. Benchmarked `hydrodynamic_step!` wall-clock time
+(500-step loop, real Detroit data): **0.136ms/step at 1 thread, climbing to
+0.484ms/step at 8 threads** — parallel got *worse* as thread count went up, not better.
+Root cause: Detroit's grid is small (IMX=31, at most ~31 columns / 1-4 branches per
+loop), so `Threads.@threads`'s own spawn/scheduling overhead exceeds the actual
+per-column work (a few dozen flops). Naively threading every loop (the first pass
+above) was correct but not yet a win at this problem size.
+
+**Fix**: `Core/Parallel.jl` (new file) — `parallel_foreach(f, range; threshold=...)`
+picks serial vs. `Threads.@threads` execution PER CALL based on `length(range)` against
+`PARALLEL_THRESHOLD`. Threshold empirically benchmarked (not guessed): a synthetic
+per-column workload shaped like `update_velocities!`'s heaviest inner-K loop
+(~100 layers) at `--threads=4` showed serial winning up to N~64-96, threaded starting to
+win at N=128 (1.33x) and improving to 3.6x by N=4096 — set `PARALLEL_THRESHOLD = 128`
+(clearly past the crossover, not sitting at the noisy breakeven point; documented as
+machine-dependent in the file's own docstring, not a universal constant). Every
+`Threads.@threads` site in `Hydrodynamics/FreeSurface.jl` (`compute_density_field!`,
+`compute_pressure_field!`, `compute_gravity_term!`, `compute_pressure_gradient!`,
+`update_velocities!`, and `solve_free_surface!`'s waterbody/branch-tier loops) now goes
+through `parallel_foreach` instead. Since Detroit's loops never reach 128 columns, this
+makes Detroit run every one of them serially — matching or beating the original
+1-thread baseline at every thread count re-tested (post-fix: ~0.10-0.20ms/step
+regardless of `--threads`, vs. the pre-fix 0.484ms/step blowup at 8 threads) — while a
+future larger reservoir's bigger grid would cross the threshold and thread
+automatically, no code change needed either way. This is the actual point of Pillar 1
+generalizing beyond Detroit (same "GENERALITY REMINDER" discipline as
+`branch_processing_order`/`branch_processing_tiers`).
+
+**Also tested**: a full simulated year for Detroit (`TMSTRT=1` to `TMEND=365`,
+`DLTMAX=1200s` → 26,208 steps) — runs in ~2.7s, and stays stable long-term (max `ELWS`
+drift `1.16e-10` over the whole run, essentially floating-point noise, not slow
+divergence) at both 1 and 4 threads. `test/runtests.jl` gained a 2000-step long-run
+stability test (not the full 26,208, to keep the suite fast, but two orders of
+magnitude more steps than the original 5-step smoke test) plus a
+`Core/Parallel: parallel_foreach` unit test that exercises both the serial and threaded
+code paths deterministically via the `threshold` override (not dependent on incidental
+range lengths or `Threads.nthreads()` at test time). Full suite now 494/494.
+
+**Next — allocation/GC overhead investigation (not started, current focus, 2026-08-14).**
+User's original motivation for the Julia port was speedup — threading alone hasn't
+delivered that at Detroit's scale (see above), so before assuming a large-grid
+threading demo would be the next lever, the more likely culprit at THIS scale needs
+checking first: `Hydrodynamics/FreeSurface.jl`'s `compute_density_field!`/
+`compute_pressure_field!`/`compute_gravity_term!`/`compute_pressure_gradient!` each
+allocate a fresh `zeros(Float64, kmx, imx)` (~3,600 elements for Detroit) EVERY
+timestep just to re-zero and refill it, and `solve_branch_free_surface!` allocates six
+more `IMX`-length arrays per branch per step — classic avoidable GC pressure in a hot
+per-timestep loop, and unlike the threading threshold, not something whose payoff
+depends on grid size. Plan (agreed with user, not yet executed): profile first
+(`@allocated`/`--track-allocation`) to confirm this is actually the dominant cost
+before changing anything — same "validate before implementing" discipline as
+everything else in this project — then preallocate reusable buffers instead of
+guessing.
+
+Also still open: real adaptive timestep (DLTF/DLTMIN/DLTD breakpoints), Tier-1
+boundary-condition IO, and non-zero forcing (ADMX/ADMZ/DM, SB/ST via `Turbulence.jl` +
+meteorology) are needed before `Simulation.jl`/`FreeSurface.jl` can run anything beyond
+the zero-flow sanity check — none of these started yet. A larger-grid parallel-speedup
+demonstration (a synthetic reservoir big enough to cross `PARALLEL_THRESHOLD`) would
+also be worth doing before claiming Pillar 1 delivers real wins, not just avoids losses
+— not done yet, only the isolated per-column-workload benchmark that derived the
+threshold itself.
 
 **GENERALITY REMINDER (user, 2026-08-11)**: this model must generalize to other
 reservoirs later, not just Detroit — do not hardcode values/assumptions beyond what the
