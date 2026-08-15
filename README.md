@@ -5,6 +5,7 @@ discussed in the project research notes (`README.md` at the project root — the
 analysis, Fortran call-graph audit, ENTRY-decomposition findings, and decision log live
 there; this file is about the Julia codebase itself).
 
+<<<<<<< HEAD
 **Status: 🚧 first-cut reduced-physics hydrodynamic run working end-to-end, now threaded
 (with a wall-clock-aware threshold, not naive always-thread).**
 `Pkg.instantiate()` / `Pkg.test()` runtime-verified against Julia 1.11.3 (494/494 tests
@@ -20,6 +21,17 @@ over segments and dependency-independent branch tiers only above an empirically
 benchmarked size threshold) — confirmed bit-identical output between 1-thread and
 4-thread runs, and confirmed the threshold avoids the wall-clock regression naive
 `Threads.@threads` caused on Detroit's small grid — see Progress Tracker.
+=======
+**Status: 🚧 first-cut reduced-physics hydrodynamic run working end-to-end.**
+`Pkg.instantiate()` / `Pkg.test()` runtime-verified against Julia 1.11.3 (481/481 tests
+passing). The IO/geometry base stack (`InputReader` → `allocate_geometry!` →
+`BathymetryReader` → `init_geometry!`) AND a reduced-physics free-surface/momentum
+solve (`Hydrodynamics/FreeSurface.jl`) AND a time-stepping driver
+(`Simulation.run_zero_flow_sanity_check!`) all run end-to-end against real Detroit
+Reservoir data, producing real per-segment TSR CSV output (`IO/OutputWriter.jl`) that
+shows a stable water surface under a zero-boundary-flow sanity check — see Progress
+Tracker. Parallel processing is the explicitly-agreed next phase, not yet started.
+>>>>>>> f6ad9b8f6faf296b40d0018c08c26fc0463d42b5
 
 ---
 
@@ -219,6 +231,7 @@ Be precise about this so nothing gets mistaken for working code:
   Detroit data — a real test of the tridiagonal assembly and branch sequencing (a bug
   in branch ordering or the `BHRHO`/`A`/`V`/`C` coefficients would show up as drift or
   NaN), not a tautology.
+<<<<<<< HEAD
   **PARALLEL PROCESSING (2026-08-14)**: `Core/Grid.jl` gained `branch_processing_tiers`
   — the same Kahn's-algorithm dependency graph `branch_processing_order` already built,
   but returning each round's "ready" set as its own group rather than flattening them.
@@ -262,6 +275,8 @@ Be precise about this so nothing gets mistaken for working code:
   done**: a larger-grid demonstration that parallelism delivers a real speedup (not just
   avoids a slowdown) — only the isolated per-column benchmark used to derive
   `PARALLEL_THRESHOLD` shows that; no full synthetic large-reservoir run yet.
+=======
+>>>>>>> f6ad9b8f6faf296b40d0018c08c26fc0463d42b5
 - **`Simulation.jl` / `IO/OutputWriter.jl`** — `run_zero_flow_sanity_check!` ties
   `init_geometry!` → `hydrodynamic_step!` → per-step TSR CSV output into one runnable
   driver. First-cut scope, matching `FreeSurface.jl`: ONE fixed `dlt = tc.DLTMAX[1]` for
@@ -521,6 +536,7 @@ more.
       TSR CSVs showing a stable water surface (`< 1e-9` drift) and zero velocity. Fixed
       `dlt`, no boundary-condition IO, no kinetics -- see "What's Actually Implemented".
       **This is the "first cut running and getting TSR outputs for Detroit" milestone
+<<<<<<< HEAD
       the user asked for (2026-08-13).**
 - [x] Parallel processing (`Threads.@threads` over segments/cells) -- **DONE (first
       pass), 2026-08-14**, per user's explicit "then next is to prepare for parallel
@@ -563,6 +579,13 @@ more.
       preallocate reusable buffers (in `W2Global`/`W2Geometry` or passed in) instead of
       guessing. Not started.
 - [ ] `LAM1` derivation traced; `RateMultipliers.jl` implemented for real
+=======
+      the user asked for (2026-08-13).** Parallel processing is the next agreed phase,
+      not yet started.
+- [ ] `LAM1` derivation traced; `RateMultipliers.jl` implemented for real
+- [ ] Parallel processing (`Threads.@threads` over segments/cells) -- NEXT STEP, per
+      user's explicit "then next is to prepare for parallel processing" (2026-08-13)
+>>>>>>> f6ad9b8f6faf296b40d0018c08c26fc0463d42b5
 - [ ] Real adaptive timestep (DLTF/DLTMIN/DLTD breakpoints), boundary-condition IO
       (Tier 1: inflow/outflow/withdrawal/tributary time series), and non-zero-flow
       forcing (ADMX/ADMZ/DM, SB/ST via `Turbulence.jl` + meteorology) -- needed before
