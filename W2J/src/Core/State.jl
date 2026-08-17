@@ -124,6 +124,26 @@ mutable struct W2Global
     DM::Matrix{Float64}      # horizontal dispersion of momentum -- NOT YET COMPUTED, always 0
     DLXRHO::Vector{Float64}  # per segment (IMX) -- static geometric factor, init.F90:735-739
 
+    # --- transport solve state (Hydrodynamics/Transport.jl), all KMX x IMX.
+    # TRANS module in Fortran (SAVE, ALLOCATABLE there; plain fields here,
+    # sized once by allocate_transport_state! and reused/mutated every
+    # timestep rather than reallocated -- see Core/Parallel.jl's module
+    # docstring for why fresh per-step zeros(...) allocations are avoided
+    # elsewhere in this codebase; same reasoning applies here from the
+    # start instead of being retrofitted later). ---
+    W::Matrix{Float64}    # vertical velocity -- NOT YET COMPUTED (continuity-derived; not ported), always 0
+    DZ::Matrix{Float64}   # vertical eddy diffusivity -- NOT YET COMPUTED (needs Turbulence.jl); reduced-physics: caller-set uniform value
+    DX::Matrix{Float64}   # horizontal dispersion coefficient -- NOT YET COMPUTED (needs DXI, Tier 1 IO); reduced-physics: caller-set
+    SF1X::Vector{Float64} # transport.f90 INTERPOLATION_MULTIPLIERS -- (DLX(I+1)+DLX(I))/2, per segment (IMX). Declared KMX x IMX in
+                          # Fortran but every assignment's RHS is K-independent -- collapsed to a per-segment vector here, same
+                          # simplification precedent as DLXRHO (Hydrodynamics/FreeSurface.jl), not a silent shape mismatch.
+    ADX::Matrix{Float64}  # horizontal advective+dispersive flux (transport.f90 HORIZONTAL_MULTIPLIERS, UPWIND branch)
+    ADZ::Matrix{Float64}  # vertical advective flux (transport.f90 VERTICAL_MULTIPLIERS, UPWIND branch)
+    AT::Matrix{Float64}   # implicit vertical-diffusion tridiagonal sub-diagonal (temperature.F90:571)
+    CT::Matrix{Float64}   # implicit vertical-diffusion tridiagonal super-diagonal (temperature.F90:572)
+    VT::Matrix{Float64}   # implicit vertical-diffusion tridiagonal diagonal (temperature.F90:573)
+    DT::Matrix{Float64}   # implicit vertical-diffusion tridiagonal RHS (temperature.F90:560-561 / wqconstituents.F90:564-565)
+
     ALLIM::Array{Float64,3}; APLIM::Array{Float64,3}
     ANLIM::Array{Float64,3}; ASLIM::Array{Float64,3}; KFS::Array{Float64,3}
     ELLIM::Array{Float64,3}; EPLIM::Array{Float64,3}
@@ -197,6 +217,9 @@ function W2Global()
         zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0),   # U, RHO, P, HPG, GRAV
         zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0),   # SB, ST, ADMX, ADMZ, DM
         Float64[],                                                         # DLXRHO
+        zeros(0, 0), zeros(0, 0), zeros(0, 0),                            # W, DZ, DX
+        Float64[], zeros(0, 0), zeros(0, 0),                              # SF1X, ADX, ADZ
+        zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0),               # AT, CT, VT, DT
         zeros(0, 0, 0), zeros(0, 0, 0),
         zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0),
         zeros(0, 0, 0), zeros(0, 0, 0),
@@ -286,6 +309,19 @@ mutable struct W2Geometry
     TRAPEZOIDAL::Vector{Bool}
     FRESH_WATER::Vector{Bool}
     SALT_WATER::Vector{Bool}
+
+    # --- NUMERICS block (w2_con.csv, not yet read by InputReader.jl -- Tier
+    # 1, same gap as FRESH_WATER/SALT_WATER's CCC/CAC dependency above),
+    # per waterbody (NWB). w2modules.F90:188 (THETA), :426 (UPWIND/
+    # ULTIMATE). Hydrodynamics/Transport.jl requires these be set
+    # explicitly (not silently defaulted) before calling -- same discipline
+    # as `compute_water_type_flags!`'s required `constituents`/`tds_active`
+    # kwargs. First cut only ports the UPWIND branch of transport.f90's
+    # advection scheme (ULTIMATE/QUICKEST deferred, see that file's module
+    # docstring) -- callers must set ULTIMATE[jw] = false. ---
+    THETA::Vector{Float64}
+    UPWIND::Vector{Bool}
+    ULTIMATE::Vector{Bool}
 end
 
 function W2Geometry()
@@ -314,6 +350,7 @@ function W2Geometry()
         Int[],
         Float64[], Float64[], String[], String[],   # T2I, ICEI, WTYPEC, GRIDC
         Bool[], Bool[], Bool[],                     # TRAPEZOIDAL, FRESH_WATER, SALT_WATER
+        Float64[], Bool[], Bool[],                  # THETA, UPWIND, ULTIMATE
     )
 end
 

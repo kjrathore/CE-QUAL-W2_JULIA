@@ -3,6 +3,7 @@ using W2J
 using Plots
 using LinearAlgebra
 using Random
+using Statistics
 
 """
 Literal transcription of `SUBROUTINE TRIDIAG` in `transport.f90:572-593`
@@ -295,6 +296,63 @@ end
             end
             @test hit_serial == hit_threaded
         end
+    end
+
+    @testset "Hydrodynamics/Transport: temperature_transport! (pure vertical diffusion)" begin
+        detroit = joinpath(@__DIR__, "..", "..", "DetroitReservoir")
+        g, geom, tc = W2J.InputReader.read_control_file(joinpath(detroit, "w2_con.csv"); debug=false)
+        W2J.InputReader.allocate_geometry!(g, geom)
+        W2J.BathymetryReader.read_bathymetry!(geom, g, joinpath(detroit, "InputFiles", "bth1.csv"), 1; debug=false)
+        g, geom, net = W2J.init_geometry!(g, geom)
+        W2J.compute_dlxrho!(g, geom)
+        W2J.allocate_hydro_state!(g)
+        W2J.allocate_transport_state!(g; dz_const=1e-3)
+        W2J.compute_sf1x!(g, geom)
+        geom.THETA = fill(0.55, g.NWB)
+        geom.UPWIND = fill(true, g.NWB)
+        geom.ULTIMATE = fill(false, g.NWB)
+
+        # Sharp step-function initial profile (warm top half, cold bottom
+        # half) at every wet segment 2:30 -- deliberately NOT a linear
+        # gradient, since pure diffusion doesn't act on a linear profile's
+        # interior (zero curvature); a step function has real curvature and
+        # should visibly smooth, giving a non-tautological test.
+        kt = g.KTWB[1]
+        for i in 2:30
+            kbi = g.KB[i]
+            kbi < kt && continue
+            midi = kt + (kbi - kt) ÷ 2
+            for k in kt:kbi
+                g.HYD[k, i, 4] = k <= midi ? 20.0 : 5.0
+            end
+        end
+        g.T1 .= g.HYD[:, :, 4]
+
+        heat(seg) = sum(g.T1[k, seg] * geom.BH2[k, seg] for k in kt:g.KB[seg])
+        # Deepest segment in branch 1 (many active layers) and the marginal
+        # one-layer segment CUS[1] (kt==kb there) -- both must conserve
+        # exactly, not just the "easy" deep case. This specific pair caught
+        # a real bug (see Hydrodynamics/Transport.jl module docstring): a
+        # DZ fill that didn't stop exactly at KB[i]-1 leaked heat at the
+        # lakebed interface, invisible in a deep segment's relative-error
+        # check but glaring (~10% in a single step) for the marginal one.
+        segs = [g.DS[1], g.CUS[1]]
+        heat_before = Dict(seg => heat(seg) for seg in segs)
+        std_before = std(g.T1[kt:g.KB[g.DS[1]], g.DS[1]])
+
+        dlt = tc.DLTMAX[1]
+        for _ in 1:500
+            W2J.temperature_transport!(g, geom, dlt)
+            g.HYD[:, :, 4] .= g.T1
+        end
+
+        @test all(isfinite, g.T1[:, 2:30])
+        for seg in segs
+            @test isapprox(heat(seg), heat_before[seg]; rtol=1e-9)
+        end
+        # Diffusion must actually smooth the step (not just conserve heat
+        # trivially by leaving it unchanged).
+        @test std(g.T1[kt:g.KB[g.DS[1]], g.DS[1]]) < std_before
     end
 
     @testset "Simulation: run_zero_flow_sanity_check! end-to-end TSR output" begin
