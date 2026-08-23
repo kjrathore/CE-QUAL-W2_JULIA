@@ -108,6 +108,39 @@ mutable struct W2Global
     QUH1::Matrix{Float64}; QDH1::Matrix{Float64}
     UXBR::Matrix{Float64}; UYBR::Matrix{Float64}; VOL::Matrix{Float64}
 
+    # --- external upstream inflow (Tier 1 boundary IO, IO/BoundaryReader.jl),
+    # per branch (NBR). w2modules.F90:203-204. QIND/TIND are the CURRENT
+    # (this-timestep, interpolated) values; QIN/TIN are what w2_4_win.f90
+    # actually applies after the INTERNAL_FLOW/DAM_INFLOW special cases (not
+    # ported -- see BoundaryReader.jl module docstring), so for now QIN==QIND
+    # and TIN==TIND for every branch this port supports (plain external
+    # UP_FLOW, not INTERNAL_FLOW/DAM_INFLOW/HEAD_FLOW). ---
+    QIN::Vector{Float64}; QIND::Vector{Float64}
+    TIN::Vector{Float64}; TIND::Vector{Float64}
+
+    # --- external downstream outflow (Tier 1 boundary IO, IO/BoundaryReader.jl),
+    # per branch (NBR). NOT the same shape as the real Fortran `QOUT(K,JB)`
+    # (KMX x NBR, one value per withdrawal-active layer, selected by
+    # withdrawal.f90's DOWNSTREAM_WITHDRAWAL selective-withdrawal algorithm
+    # -- not ported, see BoundaryReader.jl module docstring) -- deliberately
+    # named QOT, not QOUT, to flag that difference. Multiple real outlet
+    # structures at one branch (e.g. DET's POWER.cms + SPILLWAY.cms) are
+    # summed into this one scalar total (reduced-physics, confirmed with
+    # user 2026-08-17) rather than tracked separately. ---
+    QOT::Vector{Float64}
+
+    # --- distributed tributary inflow (Tier 1 boundary IO, IO/BoundaryReader.jl),
+    # per branch (NBR). w2modules.F90:203 declares QDTR real; matches the
+    # Fortran name 1:1 here (unlike QOT), since this port's meaning is the
+    # same -- a per-branch scalar total, not per-layer. Distributed across
+    # every segment in the branch proportional to top-layer surface area
+    # (hydroinout.F90:1322-1331's real formula, ported faithfully into
+    # `Hydrodynamics/FreeSurface.jl`'s `distribute_tributary!`) into `QSS`,
+    # which the free-surface solve already reads -- no new coupling point
+    # needed, unlike QIN/QOT. Gated on `DIST_TRIBS[jb]` (required explicit,
+    # Tier 1, same discipline as THETA/UPWIND/ULTIMATE). ---
+    QDTR::Vector{Float64}
+
     # --- hydrodynamic solve state (w2modules.F90's "OPEN DESIGN NOTE" fields,
     # previously deliberately omitted -- added now for Hydrodynamics/FreeSurface.jl.
     # POINTER in Fortran for the T1/T2 old/new-step swap trick; not needed in
@@ -177,6 +210,13 @@ mutable struct W2Global
     HEAD_FLOW::Vector{Bool}; INTERNAL_FLOW::Vector{Bool}
     DAM_INFLOW::Vector{Bool}; DAM_OUTFLOW::Vector{Bool}
 
+    # --- distributed tributary active flag (Tier 1, not read by InputReader.jl
+    # yet), per branch (NBR). hydroinout.F90:1322 "IF (DIST_TRIBS(JB))" gates
+    # whether QDTR(JB) gets distributed into QSS at all -- required explicit
+    # (not silently assumed true just because a real QDTFN file exists),
+    # same discipline as THETA/UPWIND/ULTIMATE. See IO/BoundaryReader.jl. ---
+    DIST_TRIBS::Vector{Bool}
+
     # --- per-waterbody flag: true unless any of its branches has SLOPE != 0 ---
     ZERO_SLOPE::Vector{Bool}
 
@@ -214,6 +254,9 @@ function W2Global()
         zeros(0, 0), zeros(0, 0), zeros(0, 0),
         zeros(0, 0), zeros(0, 0),
         zeros(0, 0), zeros(0, 0), zeros(0, 0),
+        Float64[], Float64[], Float64[], Float64[],                        # QIN, QIND, TIN, TIND
+        Float64[],                                                         # QOT
+        Float64[],                                                         # QDTR
         zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0),   # U, RHO, P, HPG, GRAV
         zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0),   # SB, ST, ADMX, ADMZ, DM
         Float64[],                                                         # DLXRHO
@@ -238,6 +281,7 @@ function W2Global()
         Bool[], Bool[], Bool[], Bool[],           # UH_INTERNAL, DH_INTERNAL, UH_EXTERNAL, DH_EXTERNAL
         Bool[], Bool[], Bool[], Bool[],           # UQ_EXTERNAL, DQ_EXTERNAL, UQ_INTERNAL, DQ_INTERNAL
         Bool[], Bool[], Bool[], Bool[],           # HEAD_FLOW, INTERNAL_FLOW, DAM_INFLOW, DAM_OUTFLOW
+        Bool[],                                   # DIST_TRIBS
         Bool[],                                   # ZERO_SLOPE
         "", "",
     )

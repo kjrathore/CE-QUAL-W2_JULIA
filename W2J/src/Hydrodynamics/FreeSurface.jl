@@ -105,8 +105,10 @@ Sizes the hydrodynamic solve arrays added to `W2Global` for this file (U,
 RHO, P, HPG, GRAV, SB, ST, ADMX, ADMZ, DM, DLXRHO) plus QSS/UXBR/UYBR
 (declared in `W2Global` since the original session but never allocated --
 needed here as the always-zero source-term arrays the free-surface solve
-reads). Call after `IO/InputReader.allocate_geometry!`, before
-`hydrodynamic_step!`.
+reads), plus QIN/QIND/TIN/TIND/QOT/QDTR (IO/BoundaryReader.jl's external
+inflow/outflow/distributed-tributary state, zero until `BoundaryReader.
+update_boundary_conditions!` is called). Call after `IO/InputReader.
+allocate_geometry!`, before `hydrodynamic_step!`.
 """
 function allocate_hydro_state!(g)
     kmx, imx = g.KMX, g.IMX
@@ -124,6 +126,21 @@ function allocate_hydro_state!(g)
     g.UXBR = zeros(Float64, kmx, imx)
     g.UYBR = zeros(Float64, kmx, imx)
     g.DLXRHO = zeros(Float64, imx)
+    g.QIN = zeros(Float64, g.NBR)
+    g.QIND = zeros(Float64, g.NBR)
+    g.TIN = zeros(Float64, g.NBR)
+    g.TIND = zeros(Float64, g.NBR)
+    g.QOT = zeros(Float64, g.NBR)
+    g.QDTR = zeros(Float64, g.NBR)
+    # DIST_TRIBS defaults to false for every branch -- unlike THETA/UPWIND/
+    # ULTIMATE (only required by opt-in functions like temperature_
+    # transport!), distribute_tributary! runs unconditionally inside every
+    # hydrodynamic_step! call, so leaving this unsized would BoundsError
+    # every existing caller, not just ones using distributed tributaries.
+    # false is the safe default (no distributed inflow unless a caller
+    # explicitly opts a branch in via real loaded data), not a silent
+    # accuracy gap the way defaulting ULTIMATE would be.
+    g.DIST_TRIBS = fill(false, g.NBR)
     return g
 end
 
@@ -312,6 +329,14 @@ function solve_branch_free_surface!(g, geom, net, jw, kt, jb, dlt)
         for k in kt:g.KB[id]
             d[id] += -g.U[k, id-1] * geom.BHR2[k, id-1] - g.QSS[k, id] + (g.UXBR[k, id] - g.UXBR[k, id-1]) * dlt
         end
+        # External downstream outflow (w2_4_win.f90:914-921's D(ID) loop
+        # includes "+QOUT(K,JB)" for every K -- reduced-physics here lumps
+        # all withdrawal into g.QOT[jb] (a scalar total, not per-layer; see
+        # IO/BoundaryReader.jl / Core/State.jl's QOT docstring), added once
+        # rather than inside the K-loop -- correct sum given QOUT(K,JB)
+        # would be 0 at every layer except the single reduced-physics
+        # withdrawal layer in the real per-layer formula.
+        d[id] += g.QOT[jb]
     end
     if g.UP_HEAD[jb]
         for k in kt:g.KBMIN[iu-1]
@@ -334,6 +359,15 @@ function solve_branch_free_surface!(g, geom, net, jw, kt, jb, dlt)
             f[id] += -g.SB[k, id] + g.ST[k, id] - g.HPG[k, id] + g.GRAV[k, id]
         end
     end
+
+    # --- External upstream inflow (w2_4_win.f90:944-956) -- traced insertion
+    # point: this happens AFTER the DN_HEAD block above and BEFORE the
+    # boundary surface elevations below, as a separate adjustment pass in
+    # the real source, not part of the main D/F assembly loop. Only genuine
+    # external UP_FLOW branches (INTERNAL_FLOW/DAM_INFLOW not ported, see
+    # IO/BoundaryReader.jl module docstring) -- g.QIND[jb] is 0 for every
+    # other branch (never loaded), so this is a no-op for them. ---
+    g.UP_FLOW[jb] && (d[iu] -= g.QIND[jb])
 
     # --- Boundary surface elevations (w2_4_win.f90:958-988) ---
     if g.UH_INTERNAL[jb]
@@ -402,6 +436,75 @@ function solve_free_surface!(g, geom, net, dlt)
 end
 
 """
+    distribute_tributary!(g, geom)
+
+hydroinout.F90:1322-1331 -- distributes each branch's `QDTR[jb]` (loaded by
+`IO/BoundaryReader.jl`) across every segment in that branch, weighted by
+the segment's share of the branch's TOTAL top-layer surface area
+(`AKBR = sum(BI(KT,I)*DLX(I))` over the branch), into `g.QSS[kt, i]` --
+the real formula, ported faithfully (not simplified, unlike PLACE_QIN/
+selective-withdrawal). Only branches with `g.DIST_TRIBS[jb]` true AND a
+nonzero `g.QDTR[jb]` are touched.
+
+MUST be called before `solve_free_surface!` in the same timestep (it
+supplies `QSS`, which the free-surface solve reads), and after `fill!(g.QSS,
+0.0)` -- matching `w2_4_win.f90:1494`'s real per-timestep `QSS = 0.0` reset
+(`QSS` is an accumulator other real modules like lateral withdrawal also
+add to; this port has no other writer yet, but the reset is still the
+correct traced behavior, not a no-op left in "just in case").
+"""
+function distribute_tributary!(g, geom)
+    for jw in 1:g.NWB
+        kt = g.KTWB[jw]
+        for jb in g.BS[jw]:g.BE[jw]
+            g.BR_INACTIVE[jb] && continue
+            (g.DIST_TRIBS[jb] && g.QDTR[jb] != 0.0) || continue
+            iu, id = g.CUS[jb], g.DS[jb]
+            akbr = sum(geom.BI[kt, i] * geom.DLX[i] for i in iu:id)
+            for i in iu:id
+                g.QSS[kt, i] += g.QDTR[jb] * geom.BI[kt, i] * geom.DLX[i] / akbr
+            end
+        end
+    end
+    return g
+end
+
+"""
+    apply_inflow_boundary!(g, geom)
+
+Sets the external upstream inflow boundary velocity `U[kt, iu-1]` for every
+genuine external UP_FLOW branch with loaded `QIND` (see
+`IO/BoundaryReader.jl`). REDUCED PHYSICS, confirmed with user (2026-08-17):
+`U = Q/Area` is the real formula, but applied entirely at the top active
+layer `KT` -- the real source (`w2_4_win.f90:1210-1270`) instead runs a
+density-driven plunge-point algorithm (`PLACE_QIN`) that distributes inflow
+across whichever layer(s) match its density, since cold/dense inflows
+physically plunge below the surface. NOT ported -- flagged, not silent.
+Physically wrong for stratification results from a real inflow-forced run
+until `PLACE_QIN` is ported; the continuity coupling in
+`solve_branch_free_surface!` (the `d[iu] -= g.QIND[jb]` term) is unaffected
+by this simplification, since that only needs the branch TOTAL, not its
+layer distribution.
+
+Call once per timestep, after `solve_free_surface!` (order doesn't affect
+`solve_free_surface!`'s own result -- it never reads `U[:, iu-1]` for a
+plain UP_FLOW branch, only for UP_HEAD -- but the boundary segment's `U`
+needs to be current before anything downstream, e.g. transport, reads it).
+"""
+function apply_inflow_boundary!(g, geom)
+    for jw in 1:g.NWB
+        kt = g.KTWB[jw]
+        for jb in g.BS[jw]:g.BE[jw]
+            g.BR_INACTIVE[jb] && continue
+            (g.UP_FLOW[jb] && g.QIND[jb] != 0.0) || continue
+            iu = g.CUS[jb]
+            g.U[kt, iu-1] = g.QIND[jb] / geom.BHR1[kt, iu-1]
+        end
+    end
+    return g
+end
+
+"""
     update_velocities!(g, geom, dlt)
 
 w2_4_win.f90:1301-1307 -- explicit horizontal velocity update. With SB/ST/
@@ -441,16 +544,22 @@ end
 """
     hydrodynamic_step!(g, geom, net, dlt)
 
-Orchestrates one reduced-physics hydrodynamic timestep: density -> pressure
--> gravity -> pressure gradient -> free-surface solve -> velocity update.
-See module docstring for exactly what's real vs. stubbed.
+Orchestrates one reduced-physics hydrodynamic timestep: reset QSS ->
+distribute tributary inflow -> density -> pressure -> gravity -> pressure
+gradient -> free-surface solve -> inflow boundary -> velocity update. See
+module docstring for exactly what's real vs. stubbed. `fill!(g.QSS, 0.0)`
+matches `w2_4_win.f90:1494`'s real per-timestep reset (see
+`distribute_tributary!`'s docstring for why this isn't a no-op).
 """
 function hydrodynamic_step!(g, geom, net, dlt)
+    fill!(g.QSS, 0.0)
+    distribute_tributary!(g, geom)
     compute_density_field!(g, geom)
     compute_pressure_field!(g, geom)
     compute_gravity_term!(g, geom)
     compute_pressure_gradient!(g, geom)
     solve_free_surface!(g, geom, net, dlt)
+    apply_inflow_boundary!(g, geom)
     update_velocities!(g, geom, dlt)
     return (g, geom)
 end

@@ -42,6 +42,7 @@ include("WaterQuality/Kinetics.jl")
 
 include("IO/InputReader.jl")
 include("IO/BathymetryReader.jl")
+include("IO/BoundaryReader.jl")
 include("IO/OutputWriter.jl")
 
 include("Plotting/LongitudinalProfile.jl")

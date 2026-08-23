@@ -8,3 +8,10 @@ DetroitReservoir/Outputs
 wiki
 CLAUDE_CODE_PROTOCOL.md
 CLAUDE.md
+
+
+Experiments\DET\outputs
+Experiments\JPP\outputs
+Experiments\OOLO\outputs
+Experiments\DET\DET_2016-20.w2l
+Experiments\OOLO\OOLO_16-20.w2l

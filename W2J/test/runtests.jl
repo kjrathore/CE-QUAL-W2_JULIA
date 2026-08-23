@@ -247,6 +247,55 @@ end
         @test maximum(abs, g.U[:, 2:30]) < 1e-9
     end
 
+    @testset "Hydrodynamics/FreeSurface: QIN/QOT boundary coupling (sign + response)" begin
+        # Real Experiments/ reservoir data (DET/JPP/OOLO) isn't part of this
+        # repo (read-only external validation data, see CLAUDE.md), so this
+        # test injects synthetic QIN/QOT values directly into Detroit's own
+        # in-repo fixture rather than depending on external files -- the
+        # SIGN and RESPONSE behavior this checks was first validated against
+        # real DET inflow/outflow data (2026-08-17): a QIN-only run raised
+        # ELWS, a QOT-only run lowered it. Same physical checks here, just
+        # against synthetic forcing so the test suite has no external
+        # dependency.
+        detroit = joinpath(@__DIR__, "..", "..", "DetroitReservoir")
+        g, geom, tc = W2J.InputReader.read_control_file(joinpath(detroit, "w2_con.csv"); debug=false)
+        W2J.InputReader.allocate_geometry!(g, geom)
+        W2J.BathymetryReader.read_bathymetry!(geom, g, joinpath(detroit, "InputFiles", "bth1.csv"), 1; debug=false)
+        g, geom, net = W2J.init_geometry!(g, geom)
+        W2J.compute_dlxrho!(g, geom)
+        W2J.allocate_hydro_state!(g)
+
+        @test g.UP_FLOW[1] && g.DN_FLOW[1]  # branch 1: external inflow AND outflow
+        dlt = tc.DLTMAX[1]
+
+        # --- QIN-only: ELWS must RISE ---
+        g.QIND[1] = 50.0
+        elws_before = copy(geom.ELWS)
+        for _ in 1:20
+            W2J.hydrodynamic_step!(g, geom, net, dlt)
+        end
+        @test all(isfinite, geom.ELWS[2:30]) && all(isfinite, g.U[:, 2:30])
+        @test geom.ELWS[g.CUS[1]] > elws_before[g.CUS[1]]
+        g.QIND[1] = 0.0
+
+        # --- QOT-only: ELWS must FALL (opposite sign from QIN, matching
+        # w2_4_win.f90's real "-QIN(JB)" vs. "+QOUT(K,JB)" asymmetry --
+        # traced, not assumed, see IO/BoundaryReader.jl) ---
+        g, geom, tc = W2J.InputReader.read_control_file(joinpath(detroit, "w2_con.csv"); debug=false)
+        W2J.InputReader.allocate_geometry!(g, geom)
+        W2J.BathymetryReader.read_bathymetry!(geom, g, joinpath(detroit, "InputFiles", "bth1.csv"), 1; debug=false)
+        g, geom, net = W2J.init_geometry!(g, geom)
+        W2J.compute_dlxrho!(g, geom)
+        W2J.allocate_hydro_state!(g)
+        g.QOT[1] = 50.0
+        elws_before2 = copy(geom.ELWS)
+        for _ in 1:20
+            W2J.hydrodynamic_step!(g, geom, net, dlt)
+        end
+        @test all(isfinite, geom.ELWS[2:30]) && all(isfinite, g.U[:, 2:30])
+        @test geom.ELWS[g.DS[1]] < elws_before2[g.DS[1]]
+    end
+
     @testset "Hydrodynamics/FreeSurface: long-run stability (2000 steps)" begin
         # The 5-step check above proves the tridiagonal assembly/branch
         # sequencing is right at start-up; it does NOT prove the reduced-
@@ -296,6 +345,76 @@ end
             end
             @test hit_serial == hit_threaded
         end
+    end
+
+    @testset "IO/BoundaryReader: read_boundary_series, interpolate_series, find_boundary_filenames" begin
+        tmp = mktempdir()
+
+        # --- read_boundary_series: real format + a real-world data gap
+        # (found via real DET USGS gauge files, e.g. "82," with no value --
+        # not a hypothetical, see BoundaryReader.jl's module docstring) ---
+        series_path = joinpath(tmp, "QIN_test.csv")
+        write(series_path, """
+            \$ Test inflow discharge,
+            # synthetic fixture,
+            JDAY,Q.m3s
+            1,23.322
+            2,22.321
+            3,
+            4,20.5
+            """)
+        series = W2J.BoundaryReader.read_boundary_series(series_path)
+        @test series.jday == [1.0, 2.0, 4.0]  # jday=3's gap row skipped
+        @test series.value == [23.322, 22.321, 20.5]
+
+        # --- interpolate_series: exact match at a recorded point, linear
+        # midpoint, and clamping outside the series' own range ---
+        @test W2J.BoundaryReader.interpolate_series(series, 1.0) == 23.322
+        @test W2J.BoundaryReader.interpolate_series(series, 1.5) ≈ (23.322 + 22.321) / 2
+        @test W2J.BoundaryReader.interpolate_series(series, 0.0) == 23.322    # before first: clamp
+        @test W2J.BoundaryReader.interpolate_series(series, 10.0) == 20.5     # after last: clamp
+        # across the skipped jday=3 gap: must interpolate jday=2 -> jday=4 directly
+        @test W2J.BoundaryReader.interpolate_series(series, 3.0) ≈ (22.321 + 20.5) / 2
+
+        # --- find_boundary_filenames: the real bug found against DET --
+        # "BR1,BR2,..." is a generic per-branch header reused by several
+        # unrelated blocks; only the row whose DATA contains real .csv
+        # filenames is the genuine boundary-filename block. Synthetic
+        # control file replicates the collision: an earlier BR1 row with
+        # plain numeric data, then the real filename block. ---
+        con_path = joinpath(tmp, "w2_con_test.csv")
+        write(con_path, """
+            some,header,stuff
+            BR1,BR2
+            2,37
+            more,stuff,here
+            BR1,BR2
+            inputs\\QIN_a.csv                    ,inputs\\QIN_b.csv
+            inputs\\TIN_a.csv                    ,X.npt - not used
+            inputs\\CIN_a.csv                    ,inputs\\CIN_b.csv
+            inputs\\QOT_a.csv                    ,Y.npt - not used
+            inputs\\QDT_a.csv                    ,Z.npt - not used
+            """)
+        fn = W2J.BoundaryReader.find_boundary_filenames(con_path, 2)
+        @test fn.qinfn == ["inputs\\QIN_a.csv", "inputs\\QIN_b.csv"]
+        @test fn.tinfn == ["inputs\\TIN_a.csv", ""]   # "not used" placeholder -> empty
+        @test fn.qotfn == ["inputs\\QOT_a.csv", ""]
+        @test fn.qdtfn == ["inputs\\QDT_a.csv", ""]
+
+        # --- read_boundary_series_summed: multi-column outflow file (e.g.
+        # real DET's QOT.csv has separate POWER.cms/SPILLWAY.cms columns) ---
+        qot_path = joinpath(tmp, "QOT_test.csv")
+        write(qot_path, """
+            \$ Test outflow,
+            # synthetic fixture,
+            JDAY,POWER.cms,SPILLWAY.cms
+            1,80.137,45.024
+            2,47.006,50.121
+            3,47.006,
+            """)
+        qot_series = W2J.BoundaryReader.read_boundary_series_summed(qot_path)
+        @test qot_series.jday == [1.0, 2.0, 3.0]
+        @test qot_series.value ≈ [80.137 + 45.024, 47.006 + 50.121, 47.006]  # blank column contributes 0
     end
 
     @testset "Hydrodynamics/Transport: temperature_transport! (pure vertical diffusion)" begin
