@@ -329,11 +329,12 @@ flow-side terms already coupled into `Hydrodynamics/FreeSurface.jl`'s
 `solve_branch_free_surface!`/`distribute_tributary!`. Traced against
 `temperature.F90`:
 
-- QIN (line 442-457): real formula uses `QINF(K,JB)` (PLACE_QIN's real
-  per-layer inflow distribution, not ported) to spread `QIN(JB)*TIN(JB)`
-  across layers. REDUCED here to match `apply_inflow_boundary!`'s own
-  simplification: all heat enters at the top active layer KT, i.e.
-  `TSS[kt,iu] += QIND[jb]*TIND[jb]`.
+- QIN (line 442-457): real formula `TSS(K,IU) += QINF(K,JB)*QIN(JB)*TIN(JB)`
+  ported faithfully as of 2026-08-24 -- `g.QINF` (per-layer inflow
+  fraction) is now real, populated by `Hydrodynamics/FreeSurface.jl`'s
+  `apply_inflow_boundary!` (the real `PLACE_QIN` density-driven
+  plunge-point port), so this spreads heat across every layer `QINF`
+  places inflow in, not just `KT`.
 - QOT (line 459-464): real formula is `TSS(K,ID) -= QOUT(K,JB)*T2(K,ID+1)`
   per withdrawal-active layer -- this port's QOT is a per-branch scalar
   with no tracked withdrawal layer (see `Core/State.jl`'s QOT docstring),
@@ -350,11 +351,11 @@ flow-side terms already coupled into `Hydrodynamics/FreeSurface.jl`'s
   and `TDTR[jb]` (inflow case) based on that sign, exactly as here.
 
 MUST be called after `fill!(g.TSS, 0.0)` (see `FreeSurface.jl`'s
-`hydrodynamic_step!` docstring) and after `distribute_tributary!` (needs
-`g.QDT` populated), and before `temperature_transport!` in the same
-timestep (it reads `g.TSS` as the RHS source term). NOT yet called from any
-driver -- `temperature_transport!` itself isn't wired into `Simulation.jl`
-yet either (see that file's module docstring).
+`hydrodynamic_step!` docstring), after `distribute_tributary!` (needs
+`g.QDT` populated), and after `apply_inflow_boundary!` (needs `g.QINF`
+populated) -- and before `temperature_transport!` in the same timestep (it
+reads `g.TSS` as the RHS source term). Called from `Simulation.jl`'s
+`run_forced_simulation!`.
 """
 function apply_temperature_sources!(g, geom)
     cold = @view g.HYD[:, :, 4]
@@ -364,7 +365,9 @@ function apply_temperature_sources!(g, geom)
             g.BR_INACTIVE[jb] && continue
             iu, id = g.CUS[jb], g.DS[jb]
             if g.UP_FLOW[jb] && g.QIND[jb] != 0.0
-                g.TSS[kt, iu] += g.QIND[jb] * g.TIND[jb]
+                for k in kt:g.KB[iu]
+                    g.TSS[k, iu] += g.QINF[k, jb] * g.QIND[jb] * g.TIND[jb]
+                end
             end
             if g.DN_FLOW[jb] && g.QOT[jb] != 0.0
                 kb_id = g.KB[id]

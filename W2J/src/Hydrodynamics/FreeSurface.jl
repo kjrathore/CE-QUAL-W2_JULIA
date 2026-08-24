@@ -134,6 +134,9 @@ function allocate_hydro_state!(g)
     g.QDTR = zeros(Float64, g.NBR)
     g.TDTR = zeros(Float64, g.NBR)
     g.QDT = zeros(Float64, imx)
+    g.QINF = zeros(Float64, kmx, g.NBR)
+    g.KTQIN = zeros(Int, g.NBR)
+    g.KBQIN = zeros(Int, g.NBR)
     # DIST_TRIBS defaults to false for every branch -- unlike THETA/UPWIND/
     # ULTIMATE (only required by opt-in functions like temperature_
     # transport!), distribute_tributary! runs unconditionally inside every
@@ -143,6 +146,10 @@ function allocate_hydro_state!(g)
     # explicitly opts a branch in via real loaded data), not a silent
     # accuracy gap the way defaulting ULTIMATE would be.
     g.DIST_TRIBS = fill(false, g.NBR)
+    # PLACE_QIN is sized lazily inside apply_inflow_boundary! (see there) --
+    # this function only takes `g`, not `geom`, so it can't size a
+    # W2Geometry field itself without changing every existing call site's
+    # signature (a much larger, unrelated churn for a one-line default).
     return g
 end
 
@@ -565,35 +572,114 @@ function distribute_tributary!(g, geom)
 end
 
 """
-    apply_inflow_boundary!(g, geom)
+    apply_inflow_boundary!(g, geom, dlt)
 
-Sets the external upstream inflow boundary velocity `U[kt, iu-1]` for every
-genuine external UP_FLOW branch with loaded `QIND` (see
-`IO/BoundaryReader.jl`). REDUCED PHYSICS, confirmed with user (2026-08-17):
-`U = Q/Area` is the real formula, but applied entirely at the top active
-layer `KT` -- the real source (`w2_4_win.f90:1210-1270`) instead runs a
-density-driven plunge-point algorithm (`PLACE_QIN`) that distributes inflow
-across whichever layer(s) match its density, since cold/dense inflows
-physically plunge below the surface. NOT ported -- flagged, not silent.
-Physically wrong for stratification results from a real inflow-forced run
-until `PLACE_QIN` is ported; the continuity coupling in
-`solve_branch_free_surface!` (the `d[iu] -= g.QIND[jb]` term) is unaffected
-by this simplification, since that only needs the branch TOTAL, not its
-layer distribution.
+Real `PLACE_QIN` port (`w2_4_win.f90:1209-1270`), ported 2026-08-24 --
+motivated by comparing a `run_forced_simulation!` run against real DET
+`outputs/tsr_1_seg33.csv` reference data (2026-08-23/24): the earlier
+all-at-`KT` reduction produced meaningfully more volatile local
+temperature swings than the real run (every branch's inflow, regardless of
+temperature, dumped straight into the surface layer instead of sinking or
+rising to its density-matched depth), plausibly the dominant cause of both
+the extra volatility AND the steady `ELWS`/`T2` drift seen in that
+comparison.
 
-Call once per timestep, after `solve_free_surface!` (order doesn't affect
-`solve_free_surface!`'s own result -- it never reads `U[:, iu-1]` for a
-plain UP_FLOW branch, only for UP_HEAD -- but the boundary segment's `U`
-needs to be current before anything downstream, e.g. transport, reads it).
+Two real branches, both ported (gated on `geom.PLACE_QIN[jw]`, required
+explicit, Tier 1 -- same discipline as `THETA`/`UPWIND`/`ULTIMATE`):
+
+- `PLACE_QIN[jw] == true`: the real density-driven plunge-point search.
+  Computes the inflow's own density (`RHOIN`, via `Hydrodynamics/
+  Density.jl`'s `density()`, reduced to `TDS=SS=0` -- no Tier-1 `CIN`
+  constituent-loading IO to feed real values, matching every other
+  `density()` call site in this port) and walks DOWN from `KT` until
+  finding the first layer whose ambient density is `>= RHOIN` (the
+  neutral-buoyancy layer). Then spreads this timestep's inflow VOLUME
+  (`QIND[jb]*dlt`) across layers around that point, filling each to at
+  most 50% of its own volume before moving on (first upward toward `KT`,
+  then downward), matching the real `QINF`/`KTQIN`/`KBQIN` bookkeeping
+  exactly -- not simplified further.
+- `PLACE_QIN[jw] == false`: the real (not this port's OWN prior
+  simplification) "off" behavior -- spreads inflow across the WHOLE
+  active column proportional to each layer's volume (`BH1(K,IU)`), not
+  concentrated at `KT`. Note this is itself already less reduced than
+  this port's PRE-2026-08-24 behavior, which put 100% at `KT` regardless
+  of `PLACE_QIN` -- that was this port's OWN extra simplification on top
+  of the real "off" case, not a faithful rendering of it.
+
+Both branches finish by setting the real per-layer boundary velocity
+`U[K,IU-1] = QINF[K,jb]*QIND[jb]/BHR1[K,IU-1]` for every `K` in
+`KT:KB[iu]` (previously only `K=KT` was ever written).
+
+Call once per timestep, after `solve_free_surface!` (needs current
+`geom.Z`-derived `VOL`/`BH1`) and `compute_density_field!` (needs current
+`g.RHO` for the `PLACE_QIN=true` branch's plunge search) -- both already
+run earlier in `hydrodynamic_step!`.
 """
-function apply_inflow_boundary!(g, geom)
+function apply_inflow_boundary!(g, geom, dlt)
+    # Lazy-sized default (false, the safe/conservative choice -- see
+    # allocate_hydro_state!'s comment for why this isn't sized there
+    # instead): apply_inflow_boundary! runs unconditionally inside every
+    # hydrodynamic_step! call, so an empty geom.PLACE_QIN would BoundsError
+    # every existing caller, same class of issue as DIST_TRIBS earlier this
+    # session.
+    isempty(geom.PLACE_QIN) && (geom.PLACE_QIN = fill(false, g.NWB))
     for jw in 1:g.NWB
         kt = g.KTWB[jw]
         for jb in g.BS[jw]:g.BE[jw]
             g.BR_INACTIVE[jb] && continue
             (g.UP_FLOW[jb] && g.QIND[jb] != 0.0) || continue
             iu = g.CUS[jb]
-            g.U[kt, iu-1] = g.QIND[jb] / geom.BHR1[kt, iu-1]
+            kb = g.KB[iu]
+            fill!(view(g.QINF, :, jb), 0.0)
+
+            if geom.PLACE_QIN[jw]
+                rhoin = density(g.TIND[jb], 0.0, 0.0, true, false, false)
+                k = kt
+                while rhoin > g.RHO[k, iu] && k < kb
+                    k += 1
+                end
+                g.KTQIN[jb] = k
+                g.KBQIN[jb] = k
+
+                vqin = g.QIND[jb] * dlt
+                vqini = vqin
+                qinfr = 1.0
+                incr = -1
+                while qinfr > 0.0
+                    if k <= kb
+                        v1 = g.VOL[k, iu]
+                        if vqin > 0.5 * v1
+                            g.QINF[k, jb] = 0.5 * v1 / vqini
+                            qinfr -= g.QINF[k, jb]
+                            vqin -= g.QINF[k, jb] * vqini
+                            if k == kt
+                                k = g.KBQIN[jb]
+                                incr = 1
+                            end
+                        else
+                            g.QINF[k, jb] = qinfr
+                            qinfr = 0.0
+                        end
+                        incr < 0 && (g.KTQIN[jb] = k)
+                        incr > 0 && (g.KBQIN[jb] = min(kb, k))
+                        k += incr
+                    else
+                        g.QINF[kt, jb] += qinfr
+                        qinfr = 0.0
+                    end
+                end
+            else
+                g.KTQIN[jb] = kt
+                g.KBQIN[jb] = kb
+                bhsum = sum(geom.BH1[k, iu] for k in kt:kb)
+                for k in kt:kb
+                    g.QINF[k, jb] = geom.BH1[k, iu] / bhsum
+                end
+            end
+
+            for k in kt:kb
+                g.U[k, iu-1] = g.QINF[k, jb] * g.QIND[jb] / geom.BHR1[k, iu-1]
+            end
         end
     end
     return g
@@ -726,7 +812,7 @@ function hydrodynamic_step!(g, geom, net, dlt)
     compute_pressure_gradient!(g, geom)
     solve_free_surface!(g, geom, net, dlt)
     recompute_top_layer_geometry!(g, geom)
-    apply_inflow_boundary!(g, geom)
+    apply_inflow_boundary!(g, geom, dlt)
     compute_horizontal_advection_of_momentum!(g, geom)
     update_velocities!(g, geom, dlt)
     return (g, geom)

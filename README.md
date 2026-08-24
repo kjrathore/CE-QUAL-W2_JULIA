@@ -6,10 +6,16 @@ for speed (multi-core parallelism), differentiability (gradient-based calibratio
 `Enzyme.jl`), and architectural flexibility (water-quality kinetics decoupled from the
 grid layer).
 
-**Status**: first-cut reduced-physics hydrodynamic run — free surface, momentum, and
-temperature transport — works end-to-end against real Detroit Reservoir data, threaded,
-498/498 tests passing. Not yet a full physics port; see [Module Status](../../wiki/Module-Status)
-for exactly what's real vs. a deliberately-flagged placeholder in each module.
+**Status**: reduced-physics hydrodynamic + temperature run — free surface, momentum
+(including real horizontal advection), boundary-condition inflow/outflow/tributary IO,
+and temperature transport — works end-to-end against real reservoir data (Detroit and
+the larger DET/JPP/OOLO test cases), threaded, 532/532 tests passing. First direct
+comparison against a real Fortran run's own output (not just internal consistency)
+found the free-surface/temperature solution diverges from the reference over several
+days — root cause still open, leading suspect is the placeholder constant vertical
+diffusivity standing in for a real turbulence closure. Not yet a full physics port; see
+[Module Status](../../wiki/Module-Status) for exactly what's real vs. a
+deliberately-flagged placeholder in each module.
 
 ---
 
@@ -118,11 +124,16 @@ for the file-by-file detail behind every box above.
 ### Current `hydrodynamic_step!` call order
 
 ```
-density → pressure → gravity → pressure gradient → free-surface solve → velocity update
+old<-new geometry swap → density → pressure → gravity → pressure gradient →
+free-surface solve → top-layer geometry recompute → inflow boundary (PLACE_QIN) →
+horizontal momentum advection → velocity update
 ```
 
-Temperature transport (`temperature_transport!`) is validated standalone but not yet
-wired into this loop.
+`temperature_transport!`/`apply_temperature_sources!` are wired into a separate,
+real-forcing driver (`Simulation.jl`'s `run_forced_simulation!`), called once per step
+alongside `hydrodynamic_step!` — not yet folded into `hydrodynamic_step!` itself. Real
+adaptive timestep (`Hydrodynamics/AdaptiveTimestep.jl`) exists and is unit-validated but
+not yet wired into either driver — both still run a fixed `dlt`.
 
 ---
 
@@ -151,7 +162,7 @@ W2J/
 │   ├── W2J.jl                  — module entry point
 │   ├── Core/                   — shared state, geometry, branch topology, threading
 │   ├── Solvers/                — Tridiagonal.jl, the one shared numerical primitive
-│   ├── Hydrodynamics/          — Density, FreeSurface, Transport, + stubs
+│   ├── Hydrodynamics/          — Density, FreeSurface, Transport, AdaptiveTimestep, + stubs
 │   ├── WaterQuality/           — rate multipliers + kinetics (mostly stubs)
 │   ├── IO/                     — control-file + bathymetry readers, TSR CSV writer
 │   ├── Plotting/                — longitudinal-profile debugging tool

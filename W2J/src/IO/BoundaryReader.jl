@@ -106,15 +106,6 @@
 #
 #   NOT PORTED YET (Tier 1, future work):
 #   - CIN/PRECIP/MET -- constituent loading, precipitation, meteorology.
-#   - The density-driven plunge-point inflow layer placement (`PLACE_QIN`,
-#     w2_4_win.f90:1210-1270) -- confirmed with user (2026-08-17) as a
-#     REDUCED-PHYSICS first cut: inflow velocity is placed entirely at the
-#     top active layer KT (`Hydrodynamics/FreeSurface.jl`'s
-#     `apply_inflow_boundary!`), not distributed to the layer(s) matching
-#     the inflow's density. Physically wrong for cold/dense inflows
-#     (they'd actually plunge below the surface), but a real, flagged
-#     simplification, not a silent one -- port PLACE_QIN before trusting
-#     stratification results from a real inflow-forced run.
 #   - The real selective-withdrawal layer selection for QOT (see above) --
 #     `g.QOT[jb]` is withdrawn from the bottom active layer only
 #     (`solve_branch_free_surface!`'s `d[id] += g.QOT[jb]` at K=KB(ID),

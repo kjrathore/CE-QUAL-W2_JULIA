@@ -157,6 +157,14 @@ mutable struct W2Global
     # Populated by `Hydrodynamics/FreeSurface.jl`'s `distribute_tributary!`. ---
     QDT::Vector{Float64}
 
+    # --- PLACE_QIN inflow-placement state (w2_4_win.f90:1212-1256), density-
+    # driven plunge-point inflow distribution -- see `Hydrodynamics/
+    # FreeSurface.jl`'s `apply_inflow_boundary!`. QINF(K,JB): per-layer
+    # fraction of QIN(JB) entering at layer K (KMX x NBR). KTQIN/KBQIN(JB):
+    # the top/bottom layer actually receiving inflow this timestep (NBR). ---
+    QINF::Matrix{Float64}
+    KTQIN::Vector{Int}; KBQIN::Vector{Int}
+
     # --- hydrodynamic solve state (w2modules.F90's "OPEN DESIGN NOTE" fields,
     # previously deliberately omitted -- added now for Hydrodynamics/FreeSurface.jl.
     # POINTER in Fortran for the T1/T2 old/new-step swap trick; not needed in
@@ -275,6 +283,8 @@ function W2Global()
         Float64[],                                                         # QDTR
         Float64[],                                                         # TDTR
         Float64[],                                                         # QDT
+        zeros(0, 0),                                                       # QINF
+        Int[], Int[],                                                      # KTQIN, KBQIN
         zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0),   # U, RHO, P, HPG, GRAV
         zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0),   # SB, ST, ADMX, ADMZ, DM
         Float64[],                                                         # DLXRHO
@@ -384,6 +394,15 @@ mutable struct W2Geometry
     THETA::Vector{Float64}
     UPWIND::Vector{Bool}
     ULTIMATE::Vector{Bool}
+
+    # --- PLACE_QIN(JW) (w2_con.csv, Tier 1, not yet read by InputReader.jl
+    # -- same gap as THETA/UPWIND/ULTIMATE), per waterbody (NWB). Gates
+    # whether `apply_inflow_boundary!` runs the real density-driven
+    # plunge-point search (true) or the simpler BH1-proportional spread
+    # across the whole column (false) -- w2_4_win.f90:1212 `IF
+    # (PLACE_QIN(JW))`. Required explicit, same discipline as THETA/UPWIND/
+    # ULTIMATE. ---
+    PLACE_QIN::Vector{Bool}
 end
 
 function W2Geometry()
@@ -413,6 +432,7 @@ function W2Geometry()
         Float64[], Float64[], String[], String[],   # T2I, ICEI, WTYPEC, GRIDC
         Bool[], Bool[], Bool[],                     # TRAPEZOIDAL, FRESH_WATER, SALT_WATER
         Float64[], Bool[], Bool[],                  # THETA, UPWIND, ULTIMATE
+        Bool[],                                     # PLACE_QIN
     )
 end
 

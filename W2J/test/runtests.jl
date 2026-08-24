@@ -326,6 +326,81 @@ end
         @test maximum(abs, g.U[:, 2:30]) < 1e-8
     end
 
+    @testset "Hydrodynamics/AdaptiveTimestep: snapshot/restore, compute_curmax, schedule, retry" begin
+        detroit = joinpath(@__DIR__, "..", "..", "DetroitReservoir")
+        g, geom, tc = W2J.InputReader.read_control_file(joinpath(detroit, "w2_con.csv"); debug=false)
+        W2J.InputReader.allocate_geometry!(g, geom)
+        W2J.BathymetryReader.read_bathymetry!(geom, g, joinpath(detroit, "InputFiles", "bth1.csv"), 1; debug=false)
+        g, geom, net = W2J.init_geometry!(g, geom)
+        W2J.compute_dlxrho!(g, geom)
+        W2J.allocate_hydro_state!(g)
+
+        # --- snapshot/restore round-trips exactly, including the "old"
+        # geometry arrays (H2/BH2/BHR2/AVH2), not just the "new" ones ---
+        snap = W2J.snapshot_hydro_state(g, geom)
+        geom.Z[10] = 999.0
+        g.U[g.KTWB[1], 10] = 42.0
+        geom.H2[g.KTWB[1], 10] = -1.0
+        W2J.restore_hydro_state!(g, geom, snap)
+        @test geom.Z[10] == snap.Z[10]
+        @test g.U[g.KTWB[1], 10] == snap.U[g.KTWB[1], 10]
+        @test geom.H2[g.KTWB[1], 10] == snap.H2[g.KTWB[1], 10]
+
+        # --- compute_curmax: an artificially huge U (via BHR1 already real)
+        # must produce a small DLTCAL relative to a modest one ---
+        dlt = tc.DLTMAX[1]
+        curmax_quiescent = W2J.compute_curmax(g, geom, dlt)
+        @test curmax_quiescent > 0 && isfinite(curmax_quiescent)
+        i_test = g.CUS[1]
+        g.U[g.KTWB[1], i_test] = 50.0   # unrealistically fast for this reservoir
+        curmax_fast = W2J.compute_curmax(g, geom, dlt)
+        @test curmax_fast < curmax_quiescent
+        g.U[g.KTWB[1], i_test] = 0.0    # restore for subsequent checks
+
+        # --- advance_dlt_schedule!: synthetic two-breakpoint schedule,
+        # confirms both the "advance" and "interpolate" branches ---
+        tc2 = deepcopy(tc)
+        tc2.NDLT = 2
+        tc2.DLTD = [1.0, 2.0]
+        tc2.DLTMAX = [200.0, 100.0]
+        tc2.DLTF = [0.8, 0.8]
+        tc2.DLTINTER = true
+        state2 = W2J.init_adaptive_timestep(tc2)
+        @test state2.dltmaxx == 200.0
+        W2J.advance_dlt_schedule!(state2, tc2, 1.5)   # halfway between breakpoints, still index 1
+        @test state2.dltdp == 1
+        @test isapprox(state2.dltmaxx, 150.0; atol=1e-9)   # interpolated halfway between 200 and 100
+        W2J.advance_dlt_schedule!(state2, tc2, 2.5)   # past the second breakpoint -- advances, then plateaus
+        @test state2.dltdp == 2
+        @test state2.dltmaxx == 100.0
+
+        # --- step_hydrodynamics_adaptive!: this quiescent zero-flow Detroit
+        # setup has no real forcing (U, BH1-BH2 change, density gradient all
+        # ~0), so compute_curmax genuinely returns an enormous value (only
+        # NONZERO_EPS bounds it) -- the CFL retry loop correctly does NOT
+        # trigger here (nothing to be unstable about), so accepted_dlt
+        # legitimately stays at the oversized starting dlt. What DOES apply
+        # regardless is the schedule cap (`next_dlt = min(..., dltmaxx)`,
+        # real update.F90:162's `IF (DLT > DLTMAXX) DLT=DLTMAXX`) -- proves
+        # advance_dlt_schedule! and the cap are actually exercised by
+        # step_hydrodynamics_adaptive!, not just callable in isolation. The
+        # retry loop's TRIGGER condition (a genuine CFL violation causing an
+        # actual restore+retry) is exercised at the formula level by the
+        # compute_curmax check above (artificially fast U -> smaller
+        # DLTCAL), NOT end-to-end here or in the real DET-data validation
+        # run (that run also never violated CFL at DLTMAX=200s -- a genuine
+        # finding, not a gap in this test) -- flagged as not yet proven via
+        # a full integration path, only at the unit level.
+        state3 = W2J.init_adaptive_timestep(tc)
+        state3.dlt = 1.0e6   # far beyond any real CFL-stable value for Detroit
+        accepted_dlt, next_dlt = W2J.step_hydrodynamics_adaptive!(g, geom, net, tc, state3, tc.TMSTRT)
+        @test accepted_dlt >= tc.DLTMIN
+        @test next_dlt <= tc.DLTMAX[1]
+        @test state3.dlt == next_dlt
+        @test all(isfinite, geom.ELWS[2:30])
+        @test all(isfinite, g.U[:, 2:30])
+    end
+
     @testset "Core/Parallel: parallel_foreach" begin
         # threshold=0 forces the Threads.@threads branch; threshold=typemax
         # forces the serial branch -- both must visit every index exactly
