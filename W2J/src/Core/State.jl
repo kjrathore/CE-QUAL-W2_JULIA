@@ -141,6 +141,22 @@ mutable struct W2Global
     # Tier 1, same discipline as THETA/UPWIND/ULTIMATE). ---
     QDTR::Vector{Float64}
 
+    # --- distributed tributary temperature (Tier 1 boundary IO), per branch
+    # (NBR). w2modules.F90 declares TDTR real; temperature.F90:416-427 reads
+    # it as the temperature counterpart of QDTR (TSS(KT,I) += TDTR(JB)*QDT(I)),
+    # matching TIN's role for QIN. See Hydrodynamics/Transport.jl's
+    # `apply_temperature_sources!`. ---
+    TDTR::Vector{Float64}
+
+    # --- per-segment distributed-tributary flow share (IMX), real Fortran
+    # name `QDT(I)` -- hydroinout.F90:1329 computes this as an intermediate
+    # (branch total QDTR(JB) apportioned by top-layer surface-area share) and
+    # temperature.F90:416-427 reuses the SAME per-segment value for the heat
+    # term, rather than recomputing it -- so unlike QDTR (a per-branch
+    # scalar), this must be stored per-segment, not just consumed inline.
+    # Populated by `Hydrodynamics/FreeSurface.jl`'s `distribute_tributary!`. ---
+    QDT::Vector{Float64}
+
     # --- hydrodynamic solve state (w2modules.F90's "OPEN DESIGN NOTE" fields,
     # previously deliberately omitted -- added now for Hydrodynamics/FreeSurface.jl.
     # POINTER in Fortran for the T1/T2 old/new-step swap trick; not needed in
@@ -152,7 +168,7 @@ mutable struct W2Global
     GRAV::Matrix{Float64}    # gravity term (channel slope)
     SB::Matrix{Float64}      # bottom shear -- NOT YET COMPUTED, always 0 (needs friction/macrophyte terms)
     ST::Matrix{Float64}      # wind/vertical shear -- NOT YET COMPUTED, always 0 (needs Turbulence.jl AZ + meteorology)
-    ADMX::Matrix{Float64}    # horizontal advection of momentum -- NOT YET COMPUTED, always 0
+    ADMX::Matrix{Float64}    # horizontal advection of momentum -- REAL (Hydrodynamics/FreeSurface.jl's compute_horizontal_advection_of_momentum!, 2026-08-23)
     ADMZ::Matrix{Float64}    # vertical advection of momentum -- NOT YET COMPUTED, always 0
     DM::Matrix{Float64}      # horizontal dispersion of momentum -- NOT YET COMPUTED, always 0
     DLXRHO::Vector{Float64}  # per segment (IMX) -- static geometric factor, init.F90:735-739
@@ -257,6 +273,8 @@ function W2Global()
         Float64[], Float64[], Float64[], Float64[],                        # QIN, QIND, TIN, TIND
         Float64[],                                                         # QOT
         Float64[],                                                         # QDTR
+        Float64[],                                                         # TDTR
+        Float64[],                                                         # QDT
         zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0),   # U, RHO, P, HPG, GRAV
         zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0),   # SB, ST, ADMX, ADMZ, DM
         Float64[],                                                         # DLXRHO

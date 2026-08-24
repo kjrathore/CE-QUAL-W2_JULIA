@@ -1,28 +1,35 @@
 # ==============================================================================
 # Simulation.jl
 #
-# First-cut time-stepping driver, tying together Core/InitGeometry.jl,
-# Hydrodynamics/FreeSurface.jl, and IO/OutputWriter.jl into a runnable
-# end-to-end simulation. See CLAUDE.md "MVP hydrodynamic run" steps 5-7 --
-# this is the "zero-flow sanity check" scope confirmed with the user
-# (2026-08-12): no inflow/outflow, reduced physics (see
-# Hydrodynamics/FreeSurface.jl module docstring for exactly what's real vs.
-# stubbed), goal is a stable free-surface over many timesteps with real TSR
-# CSV output, not a faithful port of `w2_4_win.f90`'s full driver.
+# Time-stepping drivers, tying together Core/InitGeometry.jl,
+# Hydrodynamics/FreeSurface.jl, Hydrodynamics/Transport.jl, IO/
+# BoundaryReader.jl, and IO/OutputWriter.jl into runnable end-to-end
+# simulations. Two entry points:
+#
+# - `run_zero_flow_sanity_check!` -- the original "zero-flow sanity check"
+#   scope confirmed with the user (2026-08-12): no inflow/outflow, reduced
+#   physics (see Hydrodynamics/FreeSurface.jl module docstring for exactly
+#   what's real vs. stubbed), goal is a stable free-surface over many
+#   timesteps with real TSR CSV output.
+# - `run_forced_simulation!` (2026-08-23) -- real boundary-forced driver,
+#   wiring in `IO/BoundaryReader.jl`'s QIN/TIN/QOT/QDTR/TDTR loading and
+#   `Hydrodynamics/Transport.jl`'s `apply_temperature_sources!`/
+#   `temperature_transport!`, both previously validated only via standalone
+#   scripts, never an actual driver loop.
+#
+# Neither is a faithful port of `w2_4_win.f90`'s full driver.
 #
 # NOT PORTED (flagged, not guessed away):
 # - The real adaptive timestep machinery (DLTF/DLTMIN/DLTD breakpoints,
-#   stability-based DLT selection, `w2_4_win.f90`'s `AUTO_STEPPING`) -- this
-#   driver uses one FIXED `dlt = tc.DLTMAX[1]` for every step. Correct for a
-#   reduced-physics zero-flow run (nothing destabilizes the timestep), wrong
-#   once real forcing (structures, meteorology, non-uniform density) is
-#   added -- port real DLT selection before trusting a non-sanity-check run.
-# - Any boundary condition IO (inflow/outflow/withdrawal/tributary time
-#   series) -- Tier 1, not built (CLAUDE.md "Open questions" / MVP step 8).
-#   `g.QSS`/`g.UXBR`/`g.UYBR` stay at their allocated zero forever in this
-#   driver.
-# - Kinetics / constituent transport (WaterQuality/*, Hydrodynamics/
-#   Transport.jl) -- both still stubs, not called here.
+#   stability-based DLT selection, `w2_4_win.f90`'s `AUTO_STEPPING`) -- both
+#   drivers use one FIXED `dlt = tc.DLTMAX[1]` for every step. Correct for a
+#   reduced-physics zero-flow run (nothing destabilizes the timestep); NOT
+#   yet proven safe for `run_forced_simulation!` under strong real forcing
+#   over a long run -- port real DLT selection before trusting that case.
+# - Constituent transport (`constituent_transport!`, generic constituents,
+#   WaterQuality/* kinetics) -- `run_forced_simulation!` calls
+#   `temperature_transport!` but not `constituent_transport!` (no `CIN`
+#   Tier-1 IO yet, see `IO/BoundaryReader.jl`).
 # ==============================================================================
 
 """
@@ -52,6 +59,64 @@ function run_zero_flow_sanity_check!(g, geom, net, tc; nsteps::Int, output_dir::
         OutputWriter.write_tsr_row!(writer, g, geom, jday, dlt)  # initial condition
         for _ in 1:nsteps
             hydrodynamic_step!(g, geom, net, dlt)
+            jday += dlt / 86400.0
+            OutputWriter.write_tsr_row!(writer, g, geom, jday, dlt)
+        end
+    finally
+        OutputWriter.close_tsr_files!(writer)
+    end
+    return (g, geom, jday)
+end
+
+"""
+    run_forced_simulation!(g, geom, net, tc, boundary; nsteps, output_dir, output_segments, base_name="tsr")
+
+Real boundary-forced driver, closing the gap flagged since 2026-08-15 --
+`temperature_transport!`/`apply_temperature_sources!` and `IO/
+BoundaryReader.jl`'s per-timestep boundary update were validated standalone
+but never wired into an actual driver loop. Each step: interpolate boundary
+conditions at the current `jday` (`BoundaryReader.update_boundary_
+conditions!`), run one reduced-physics hydrodynamic step (QIN/QOT/QDTR
+coupling, see `Hydrodynamics/FreeSurface.jl`), populate `g.TSS` with the
+reduced-physics QIN/QOT/QDT heat sources (`Hydrodynamics/Transport.jl`'s
+`apply_temperature_sources!`), solve temperature transport, then the real
+`temperature.F90`/`update.F90` old<-new swap for temperature
+(`g.HYD[:,:,4] .= g.T1`, mirroring the `H2 .= H1` etc. swap already inside
+`hydrodynamic_step!`). Writes TSR rows including the `T2(C)` column (see
+`IO/OutputWriter.jl`).
+
+`boundary` is `IO/BoundaryReader.jl`'s `load_boundary_conditions` return
+value. Caller must have already run `init_geometry!`, `compute_dlxrho!`,
+`allocate_hydro_state!`, `allocate_transport_state!`, `compute_sf1x!`, and
+set `geom.THETA`/`geom.UPWIND`/`geom.ULTIMATE` (Tier 1, not read by
+`InputReader.jl` yet -- see `Hydrodynamics/Transport.jl`'s
+`temperature_transport!` docstring) -- this function does not allocate
+transport state itself, matching `run_zero_flow_sanity_check!`'s existing
+"caller allocates, this function only steps" convention.
+
+Same `dlt = tc.DLTMAX[1]` fixed-timestep reduced physics as `run_zero_flow_
+sanity_check!` -- see that function's module docstring for why the real
+adaptive-timestep machinery isn't ported yet. Constituent transport
+(`constituent_transport!`) is NOT called here -- temperature only, matching
+this port's current Tier-1 boundary IO scope (QIN/TIN/QOT/QDTR/TDTR, no
+`CIN` constituent loading yet).
+
+Returns `(g, geom, jday_final)`.
+"""
+function run_forced_simulation!(g, geom, net, tc, boundary; nsteps::Int, output_dir::AbstractString,
+                                 output_segments::Vector{Int}, base_name::AbstractString="tsr")
+    dlt = tc.DLTMAX[1]
+    jday = tc.TMSTRT
+
+    writer = OutputWriter.open_tsr_files(output_dir, base_name, output_segments; include_temp=true)
+    try
+        OutputWriter.write_tsr_row!(writer, g, geom, jday, dlt)  # initial condition
+        for _ in 1:nsteps
+            BoundaryReader.update_boundary_conditions!(g, boundary, jday)
+            hydrodynamic_step!(g, geom, net, dlt)
+            apply_temperature_sources!(g, geom)
+            temperature_transport!(g, geom, dlt)
+            g.HYD[:, :, 4] .= g.T1
             jday += dlt / 86400.0
             OutputWriter.write_tsr_row!(writer, g, geom, jday, dlt)
         end

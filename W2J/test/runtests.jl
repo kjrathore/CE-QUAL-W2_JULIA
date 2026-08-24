@@ -394,12 +394,14 @@ end
             inputs\\CIN_a.csv                    ,inputs\\CIN_b.csv
             inputs\\QOT_a.csv                    ,Y.npt - not used
             inputs\\QDT_a.csv                    ,Z.npt - not used
+            inputs\\TDT_a.csv                    ,W.npt - not used
             """)
         fn = W2J.BoundaryReader.find_boundary_filenames(con_path, 2)
         @test fn.qinfn == ["inputs\\QIN_a.csv", "inputs\\QIN_b.csv"]
         @test fn.tinfn == ["inputs\\TIN_a.csv", ""]   # "not used" placeholder -> empty
         @test fn.qotfn == ["inputs\\QOT_a.csv", ""]
         @test fn.qdtfn == ["inputs\\QDT_a.csv", ""]
+        @test fn.tdtfn == ["inputs\\TDT_a.csv", ""]
 
         # --- read_boundary_series_summed: multi-column outflow file (e.g.
         # real DET's QOT.csv has separate POWER.cms/SPILLWAY.cms columns) ---

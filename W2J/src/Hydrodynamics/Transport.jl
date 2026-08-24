@@ -321,6 +321,71 @@ function transport_solve!(new_field, g, jb, kt)
 end
 
 """
+    apply_temperature_sources!(g, geom)
+
+Populates `g.TSS` with the reduced-physics external-boundary heat-source
+terms this port supports -- QIN/TIN, QOT, and QDT/TDTR -- mirroring the
+flow-side terms already coupled into `Hydrodynamics/FreeSurface.jl`'s
+`solve_branch_free_surface!`/`distribute_tributary!`. Traced against
+`temperature.F90`:
+
+- QIN (line 442-457): real formula uses `QINF(K,JB)` (PLACE_QIN's real
+  per-layer inflow distribution, not ported) to spread `QIN(JB)*TIN(JB)`
+  across layers. REDUCED here to match `apply_inflow_boundary!`'s own
+  simplification: all heat enters at the top active layer KT, i.e.
+  `TSS[kt,iu] += QIND[jb]*TIND[jb]`.
+- QOT (line 459-464): real formula is `TSS(K,ID) -= QOUT(K,JB)*T2(K,ID+1)`
+  per withdrawal-active layer -- this port's QOT is a per-branch scalar
+  with no tracked withdrawal layer (see `Core/State.jl`'s QOT docstring),
+  so REDUCED here to withdraw ambient (old-timestep) heat from the
+  branch's own bottom active layer at its downstream segment:
+  `TSS[kb_id,id] -= QOT[jb]*cold[kb_id,id]` -- NOT the real `T2(K,ID+1)`
+  (the segment just past the branch's downstream boundary), since this
+  port hasn't traced what that neighbor-segment convention means
+  physically; flagged as a simplification, not a silent guess.
+- QDT (line 416-427): real formula ported faithfully -- `QDT[i]` (the
+  per-segment share stored by `distribute_tributary!`) can itself be
+  negative (a branch could theoretically pull water OUT via a negative
+  QDTR); the real source picks between ambient temperature (outflow case)
+  and `TDTR[jb]` (inflow case) based on that sign, exactly as here.
+
+MUST be called after `fill!(g.TSS, 0.0)` (see `FreeSurface.jl`'s
+`hydrodynamic_step!` docstring) and after `distribute_tributary!` (needs
+`g.QDT` populated), and before `temperature_transport!` in the same
+timestep (it reads `g.TSS` as the RHS source term). NOT yet called from any
+driver -- `temperature_transport!` itself isn't wired into `Simulation.jl`
+yet either (see that file's module docstring).
+"""
+function apply_temperature_sources!(g, geom)
+    cold = @view g.HYD[:, :, 4]
+    for jw in 1:g.NWB
+        kt = g.KTWB[jw]
+        for jb in g.BS[jw]:g.BE[jw]
+            g.BR_INACTIVE[jb] && continue
+            iu, id = g.CUS[jb], g.DS[jb]
+            if g.UP_FLOW[jb] && g.QIND[jb] != 0.0
+                g.TSS[kt, iu] += g.QIND[jb] * g.TIND[jb]
+            end
+            if g.DN_FLOW[jb] && g.QOT[jb] != 0.0
+                kb_id = g.KB[id]
+                g.TSS[kb_id, id] -= g.QOT[jb] * cold[kb_id, id]
+            end
+            if g.DIST_TRIBS[jb] && g.QDTR[jb] != 0.0
+                for i in iu:id
+                    qdt_i = g.QDT[i]
+                    if qdt_i < 0.0
+                        g.TSS[kt, i] += cold[kt, i] * qdt_i
+                    else
+                        g.TSS[kt, i] += g.TDTR[jb] * qdt_i
+                    end
+                end
+            end
+        end
+    end
+    return g
+end
+
+"""
     temperature_transport!(g, geom, dlt)
 
 Orchestrates one timestep of temperature transport for every waterbody/

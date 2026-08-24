@@ -132,6 +132,8 @@ function allocate_hydro_state!(g)
     g.TIND = zeros(Float64, g.NBR)
     g.QOT = zeros(Float64, g.NBR)
     g.QDTR = zeros(Float64, g.NBR)
+    g.TDTR = zeros(Float64, g.NBR)
+    g.QDT = zeros(Float64, imx)
     # DIST_TRIBS defaults to false for every branch -- unlike THETA/UPWIND/
     # ULTIMATE (only required by opt-in functions like temperature_
     # transport!), distribute_tributary! runs unconditionally inside every
@@ -436,6 +438,88 @@ function solve_free_surface!(g, geom, net, dlt)
 end
 
 """
+    recompute_top_layer_geometry!(g, geom)
+
+w2_4_win.f90:1024-1091 (the non-TRAPEZOIDAL "Updated surface layer and
+geometry" block, RECT only -- matches this port's existing TRAPEZOIDAL
+scope restriction, see `Core/InitGeometry.jl`'s module docstring) --
+recomputes `H1`/`BH1`/`BHR1`/`AVH1`/`BI`/`BKT`/`VOL` at the top active
+layer `KT` from the just-solved `geom.Z` (`solve_free_surface!`'s output).
+
+THIS WAS A REAL, MISSING PREREQUISITE, not a speculative addition --
+found via testing `apply_temperature_sources!`/TDTR against real DET data
+(2026-08-23): `H1`/`BH1`/`BHR1`/`AVH1` are populated ONCE at init
+(`Core/InitGeometry.jl`'s `H1 .= H2` etc., itself just an "old=new" copy
+for the very first step) and then NEVER updated again anywhere in this
+codebase, even though `solve_free_surface!` changes `geom.Z` every
+timestep. Concretely, this meant any `QSS`-driven volume change (from
+QIN/QOT/QDTR) never reached the transport equations' dilution term --
+`assemble_transport_rhs!` divides by a `geom.BH1` that was frozen at the
+initial condition -- so a TDTR sign-check came out warming when it should
+have shown cooling. This function is the fix; ported directly from the
+exact formula `Core/InitGeometry.jl`'s own init-time `BH2`/`BKT`/`BI`/
+`AVH2`/`AVHR`/`BHR2` computation already uses (same math, "1"-suffix
+arrays, current `geom.Z` instead of the init-time `Z`) -- not guessed, the
+init code IS the reference translation of this same real Fortran block.
+
+REDUCED PHYSICS, first cut (user authorized starting this port 2026-08-23;
+these specific simplifications are this port's own scoping call, flagged
+here rather than confirmed line-by-line, same discipline as INTERP_INFLOW):
+- No `KTI(I)` DO-WHILE crossing adjustment (w2_4_win.f90:1028-1044) -- this
+  port assumes `Z` stays within the SAME discrete bathymetry sub-layer
+  `g.KTI[i]` was assigned at init for the whole run. Reasonable for the
+  small `ELWS` excursions (order 0.01-0.5m) seen in every validation run so
+  far, wrong once a real multi-year forced run pushes `Z` across a whole
+  sub-layer boundary -- port the crossing adjustment before trusting a
+  long, strongly-forced run.
+- No `CONSTRICTION`/`BCONSTRICTION` correction -- already a no-op
+  elsewhere in this port (`Core/InitGeometry.jl`: "CONSTRICTION not
+  ported... always false"), consistent here.
+- No `KBI(I) < KB(I)` thin-bottom-layer correction to `BKT`/`AVHR` --
+  `Core/State.jl`'s `KBI` field exists but this port doesn't yet use it;
+  flagged, not silently applied.
+
+MUST be called after `solve_free_surface!` (needs the new `geom.Z`) and
+before anything that reads `H1`/`BH1`/`BHR1`/`AVH1` for the CURRENT step
+(`update_velocities!`, and a future `temperature_transport!`/
+`constituent_transport!` call once wired into this driver). The real
+`update.F90` "old<-new" swap (`H2=H1` etc., done ONCE per timestep before
+the new Z-solve) is `hydrodynamic_step!`'s job, not this function's --
+this function only ever WRITES the "1" (new) arrays.
+"""
+function recompute_top_layer_geometry!(g, geom)
+    for jw in 1:g.NWB
+        kt = g.KTWB[jw]
+        for jb in g.BS[jw]:g.BE[jw]
+            g.BR_INACTIVE[jb] && continue
+            iu, id = g.CUS[jb], g.DS[jb]
+            for i in (iu-1):(id+1)
+                kti = g.KTI[i]
+                geom.H1[kt, i] = geom.H[kt, i] - geom.Z[i]
+                geom.AVH1[kt, i] = (geom.H1[kt, i] + geom.H1[kt+1, i]) * 0.5
+
+                bh1_kt = geom.B[kti, i] * (geom.EL[kt, i] - geom.EL[kti+1, i] - geom.Z[i] * geom.COSA[jb]) / geom.COSA[jb]
+                kt == kti && (bh1_kt = geom.H1[kt, i] * geom.B[kt, i])
+                for k in (kti+1):kt
+                    bh1_kt += geom.BNEW[k, i] * geom.H[k, i]
+                end
+                geom.BH1[kt, i] = bh1_kt
+                geom.BKT[i] = bh1_kt / geom.H1[kt, i]
+                geom.BI[kt, i] = geom.B[kti, i]
+                g.VOL[kt, i] = bh1_kt * geom.DLX[i]
+            end
+            for i in (iu-1):id
+                geom.AVHR[kt, i] = geom.H1[kt, i] + (geom.H1[kt, i+1] - geom.H1[kt, i]) * geom.DLX[i] / (geom.DLX[i] + geom.DLX[i+1])
+                geom.BHR1[kt, i] = geom.BH1[kt, i] + (geom.BH1[kt, i+1] - geom.BH1[kt, i]) * geom.DLX[i] / (geom.DLX[i] + geom.DLX[i+1])
+            end
+            geom.AVHR[kt, id+1] = geom.H1[kt, id+1]
+            geom.BHR1[kt, id+1] = geom.BH1[kt, id+1]
+        end
+    end
+    return g
+end
+
+"""
     distribute_tributary!(g, geom)
 
 hydroinout.F90:1322-1331 -- distributes each branch's `QDTR[jb]` (loaded by
@@ -452,6 +536,15 @@ supplies `QSS`, which the free-surface solve reads), and after `fill!(g.QSS,
 (`QSS` is an accumulator other real modules like lateral withdrawal also
 add to; this port has no other writer yet, but the reset is still the
 correct traced behavior, not a no-op left in "just in case").
+
+Also stores the per-segment share into `g.QDT[i]` (real Fortran name
+`QDT(I)`, hydroinout.F90:1329) -- NOT just a local intermediate here, since
+`temperature.F90:416-427` reuses this exact per-segment value for the
+distributed-tributary heat term (`TSS(KT,I) += TDTR(JB)*QDT(I)`,
+`Hydrodynamics/Transport.jl`'s `apply_temperature_sources!`). Segments
+outside any `DIST_TRIBS` branch keep whatever `QDT` held from the previous
+step's `fill!` in the caller -- callers zero it the same way `QSS`/`TSS` are
+zeroed (`hydrodynamic_step!`'s `fill!(g.QDT, 0.0)`).
 """
 function distribute_tributary!(g, geom)
     for jw in 1:g.NWB
@@ -462,7 +555,9 @@ function distribute_tributary!(g, geom)
             iu, id = g.CUS[jb], g.DS[jb]
             akbr = sum(geom.BI[kt, i] * geom.DLX[i] for i in iu:id)
             for i in iu:id
-                g.QSS[kt, i] += g.QDTR[jb] * geom.BI[kt, i] * geom.DLX[i] / akbr
+                qdt_i = g.QDTR[jb] * geom.BI[kt, i] * geom.DLX[i] / akbr
+                g.QDT[i] = qdt_i
+                g.QSS[kt, i] += qdt_i
             end
         end
     end
@@ -505,12 +600,61 @@ function apply_inflow_boundary!(g, geom)
 end
 
 """
+    compute_horizontal_advection_of_momentum!(g, geom)
+
+w2_4_win.f90:845-854 -- explicit horizontal advection of momentum, `ADMX`.
+Ported for real: all its inputs (`U`, `BH2`, `DLXR`) are already real in
+this port, unlike `ADMZ`/`DM` (see below) -- no new Tier-1 IO needed.
+Upwind-selected via `UDR`/`UDL` (`DSIGN`-based direction switches in the
+real Fortran) -- translated as a `>= 0.0` ternary rather than Julia's
+`sign`, since `DSIGN(1.0,0.0)` treats exactly-zero as positive and `sign(0)
+== 0` would silently zero out both branches of the blend at that one point.
+
+Found relevant while investigating why `U` stayed 0 at a real inflow-forced
+interior segment (2026-08-23, see CLAUDE.md's `IO/OutputWriter.jl` `KTWB`
+bug entry) -- `ADMX`/`ADMZ`/`DM` were all flagged "NOT YET COMPUTED" from
+the original `FreeSurface.jl` work; this ports the one of the three with no
+missing prerequisite. `ADMZ` (needs `W`, vertical velocity -- continuity-
+derived, not ported) and `DM` (needs `AX(JW)`, horizontal eddy viscosity --
+Tier 1, not read by `InputReader.jl` yet) remain zero, flagged separately
+in `Core/State.jl`'s existing field comments.
+
+MUST be called after `apply_inflow_boundary!` (needs the boundary `U` set,
+since `ADMX[kt,iu]` reads `U[kt,iu-1]`) and before `update_velocities!`
+(consumes `ADMX` as an explicit forcing term) in the same timestep.
+
+PARALLEL PROCESSING: threaded over segments `i`, matching `update_
+velocities!`'s own pattern -- each `i` only writes its own `ADMX[:,i]`,
+reading neighbor columns `i-1`/`i+1` (never writing them).
+"""
+function compute_horizontal_advection_of_momentum!(g, geom)
+    for jw in 1:g.NWB
+        kt = g.KTWB[jw]
+        for jb in g.BS[jw]:g.BE[jw]
+            g.BR_INACTIVE[jb] && continue
+            iu, id = g.CUS[jb], g.DS[jb]
+            parallel_foreach(iu:(id-1)) do i
+                for k in kt:g.KBMIN[i]
+                    udr = (g.U[k, i] + g.U[k, i+1]) * 0.5 >= 0.0 ? 1.0 : 0.0
+                    udl = (g.U[k, i] + g.U[k, i-1]) * 0.5 >= 0.0 ? 1.0 : 0.0
+                    g.ADMX[k, i] = (geom.BH2[k, i+1] * (g.U[k, i+1] + g.U[k, i]) * 0.5 * (udr * g.U[k, i] + (1.0 - udr) * g.U[k, i+1]) -
+                                    geom.BH2[k, i] * (g.U[k, i] + g.U[k, i-1]) * 0.5 * (udl * g.U[k, i-1] + (1.0 - udl) * g.U[k, i])) / geom.DLXR[i]
+                end
+            end
+        end
+    end
+    return g
+end
+
+"""
     update_velocities!(g, geom, dlt)
 
-w2_4_win.f90:1301-1307 -- explicit horizontal velocity update. With SB/ST/
-ADMX/ADMZ/DM all zero (see module docstring) and HPG/GRAV zero for Detroit's
-uniform density and flat slope, this reduces to `U_new = U_old*BHR2/BHR1`
--- stays at 0 given a zero-flow start, as expected.
+w2_4_win.f90:1301-1307 -- explicit horizontal velocity update. `ADMX` is now
+real (`compute_horizontal_advection_of_momentum!`, 2026-08-23); `SB`/`ST`/
+`ADMZ`/`DM` are still zero (see module docstring). For a zero-flow start
+with uniform density and flat slope this still reduces to `U_new =
+U_old*BHR2/BHR1` -- stays at 0, as expected -- since `ADMX` itself is 0
+wherever `U` is uniformly 0.
 
 PARALLEL PROCESSING: threaded over segments `i`, each writing only its own
 column `g.U[:, i]` and reading only its own column's data -- embarrassingly
@@ -544,22 +688,46 @@ end
 """
     hydrodynamic_step!(g, geom, net, dlt)
 
-Orchestrates one reduced-physics hydrodynamic timestep: reset QSS ->
-distribute tributary inflow -> density -> pressure -> gravity -> pressure
-gradient -> free-surface solve -> inflow boundary -> velocity update. See
-module docstring for exactly what's real vs. stubbed. `fill!(g.QSS, 0.0)`
-matches `w2_4_win.f90:1494`'s real per-timestep reset (see
-`distribute_tributary!`'s docstring for why this isn't a no-op).
+Orchestrates one reduced-physics hydrodynamic timestep: old<-new geometry
+swap -> reset QSS/TSS/QDT -> distribute tributary inflow -> density ->
+pressure -> gravity -> pressure gradient -> free-surface solve -> top-layer
+geometry recompute -> inflow boundary -> velocity update. See module
+docstring for exactly what's real vs. stubbed. `fill!(g.QSS, 0.0)` matches
+`w2_4_win.f90:1494`'s real per-timestep reset (see `distribute_tributary!`'s
+docstring for why this isn't a no-op). `g.TSS` is reset here too --
+`update.F90:44-45` resets `QSS(K,I)` and `TSS(K,I)` together in the same
+real per-timestep pass, and `Hydrodynamics/Transport.jl`'s
+`apply_temperature_sources!` (called by a future driver, not yet wired into
+this function) depends on `TSS` starting each step at zero.
+
+The `geom.H2 .= geom.H1` etc. swap at the top matches `update.F90:42-53`'s
+real "old<-new" pass (`H2(K,I)=H1(K,I)`, `BH2(K,I)=BH1(K,I)`, etc.) -- MUST
+run before `recompute_top_layer_geometry!` overwrites the "1" (new) arrays
+below, so `update_velocities!`'s `BHR2/BHR1` ratio and a future transport
+call's `cold`/`BH2` terms see last step's new values as this step's old
+baseline, not this step's own new values. `recompute_top_layer_geometry!`
+runs right after `solve_free_surface!` since it needs the freshly solved
+`geom.Z` -- see that function's docstring for what was found missing (real,
+not speculative: `H1`/`BH1`/`BHR1`/`AVH1` were frozen at their init values
+forever until this was added, 2026-08-23).
 """
 function hydrodynamic_step!(g, geom, net, dlt)
+    geom.H2 .= geom.H1
+    geom.BH2 .= geom.BH1
+    geom.BHR2 .= geom.BHR1
+    geom.AVH2 .= geom.AVH1
     fill!(g.QSS, 0.0)
+    fill!(g.TSS, 0.0)
+    fill!(g.QDT, 0.0)
     distribute_tributary!(g, geom)
     compute_density_field!(g, geom)
     compute_pressure_field!(g, geom)
     compute_gravity_term!(g, geom)
     compute_pressure_gradient!(g, geom)
     solve_free_surface!(g, geom, net, dlt)
+    recompute_top_layer_geometry!(g, geom)
     apply_inflow_boundary!(g, geom)
+    compute_horizontal_advection_of_momentum!(g, geom)
     update_velocities!(g, geom, dlt)
     return (g, geom)
 end

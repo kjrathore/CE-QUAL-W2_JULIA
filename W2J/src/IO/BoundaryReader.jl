@@ -95,9 +95,17 @@
 #     via `Hydrodynamics/FreeSurface.jl`'s `distribute_tributary!`, ported
 #     faithfully (real area-weighting formula, not simplified).
 #
+#   - `TDTR(JB)` (distributed tributary temperature) is the temperature
+#     counterpart of QDTR, gated on the same `DIST_TRIBS(JB)` flag (real:
+#     temperature.F90:416-427, `Hydrodynamics/Transport.jl`'s
+#     `apply_temperature_sources!` -- NOT coupled into the free-surface
+#     solve like QIN/QOT/QDTR, since temperature only affects the transport
+#     pass). `Core/State.jl`'s `QDT` (the per-segment share `distribute_
+#     tributary!` already computes) is reused for this rather than
+#     recomputed -- matching the real Fortran's own reuse.
+#
 #   NOT PORTED YET (Tier 1, future work):
-#   - TDT/CIN/PRECIP/MET -- distributed tributary temperature, constituent
-#     loading, precipitation, meteorology.
+#   - CIN/PRECIP/MET -- constituent loading, precipitation, meteorology.
 #   - The density-driven plunge-point inflow layer placement (`PLACE_QIN`,
 #     w2_4_win.f90:1210-1270) -- confirmed with user (2026-08-17) as a
 #     REDUCED-PHYSICS first cut: inflow velocity is placed entirely at the
@@ -222,20 +230,20 @@ function interpolate_series(series::BoundarySeries, jday::Real)
 end
 
 """
-    find_boundary_filenames(con_path, nbr) -> (qinfn, tinfn, qotfn, qdtfn)
+    find_boundary_filenames(con_path, nbr) -> (qinfn, tinfn, qotfn, qdtfn, tdtfn)
 
 Searches `w2_con.csv` for the "BR1,BR2,...,BR<n>" label row (the header of
 the per-branch boundary-filename block, e.g. `w2_con.csv:883` in the DET
 experiment) and reads the rows below it: QINFN (`br_row+1`), TINFN
 (`br_row+2`), CINFN (`br_row+3`, skipped -- constituent loading not ported),
-QOTFN (`br_row+4`), QDTFN (`br_row+5`) -- row order confirmed against the
-real DET control file, not assumed. SEARCH-based, not positional,
-deliberately: this block sits ~800 rows past where `IO/InputReader.jl`'s
-Phase A parsing stops (structures, withdrawals, the full constituent
-block, output control, and kinetics rates all sit between), and there is
-no value in requiring all of that to be understood first just to reach one
-filename block. A row is a "not used" placeholder (not a real file) if it
-doesn't end in `.csv` after trimming.
+QOTFN (`br_row+4`), QDTFN (`br_row+5`), TDTFN (`br_row+6`) -- row order
+confirmed against the real DET control file (`w2_con.csv:882-892`), not
+assumed. SEARCH-based, not positional, deliberately: this block sits ~800
+rows past where `IO/InputReader.jl`'s Phase A parsing stops (structures,
+withdrawals, the full constituent block, output control, and kinetics rates
+all sit between), and there is no value in requiring all of that to be
+understood first just to reach one filename block. A row is a "not used"
+placeholder (not a real file) if it doesn't end in `.csv` after trimming.
 """
 function find_boundary_filenames(con_path::AbstractString, nbr::Int)
     lines = readlines(con_path)
@@ -261,26 +269,31 @@ function find_boundary_filenames(con_path::AbstractString, nbr::Int)
     tinfn = strip.(split(lines[br_row+2], ','))[1:nbr]
     qotfn = strip.(split(lines[br_row+4], ','))[1:nbr]
     qdtfn = strip.(split(lines[br_row+5], ','))[1:nbr]
+    tdtfn = strip.(split(lines[br_row+6], ','))[1:nbr]
     return (qinfn = [is_real_file(f) ? f : "" for f in qinfn],
             tinfn = [is_real_file(f) ? f : "" for f in tinfn],
             qotfn = [is_real_file(f) ? f : "" for f in qotfn],
-            qdtfn = [is_real_file(f) ? f : "" for f in qdtfn])
+            qdtfn = [is_real_file(f) ? f : "" for f in qdtfn],
+            tdtfn = [is_real_file(f) ? f : "" for f in tdtfn])
 end
 
 """
-    load_boundary_conditions(con_path, base_dir, g) -> (inflow=Dict, outflow=Dict, dist_trib=Dict)
+    load_boundary_conditions(con_path, base_dir, g) -> (inflow=Dict, outflow=Dict, dist_trib=Dict, dist_trib_temp=Dict)
 
 Loads external upstream inflow (QIN/TIN, gated on `g.UP_FLOW[jb]`), external
 downstream outflow (QOT, gated on `g.DN_FLOW[jb]`, summed across however
 many real outlet-structure columns that branch's `QOTFN` file has -- see
-`read_boundary_series_summed`), and distributed tributary inflow (QDTR,
-gated on `g.DIST_TRIBS[jb]` -- required explicit, see `Core/State.jl`'s
-QDTR docstring) for every branch with a real (non-"not used") filename.
-Returns three dicts, `inflow::Dict{Int,@NamedTuple{qin,tin}}`,
-`outflow::Dict{Int,BoundarySeries}`, `dist_trib::Dict{Int,BoundarySeries}`,
-keyed by branch number -- deliberately NOT stored inside `W2Global` (no
-Fortran equivalent holds a loaded-series cache; this follows the same
-"separate object threaded through calls" pattern as `Core/Grid.jl`'s
+`read_boundary_series_summed`), distributed tributary inflow (QDTR, gated
+on `g.DIST_TRIBS[jb]` -- required explicit, see `Core/State.jl`'s QDTR
+docstring), and distributed tributary temperature (TDTR, gated the same
+way -- real Fortran couples it via `Hydrodynamics/Transport.jl`'s
+`apply_temperature_sources!`, not the free-surface solve) for every branch
+with a real (non-"not used") filename. Returns four dicts,
+`inflow::Dict{Int,@NamedTuple{qin,tin}}`, `outflow::Dict{Int,BoundarySeries}`,
+`dist_trib::Dict{Int,BoundarySeries}`, `dist_trib_temp::Dict{Int,
+BoundarySeries}`, keyed by branch number -- deliberately NOT stored inside
+`W2Global` (no Fortran equivalent holds a loaded-series cache; this follows
+the same "separate object threaded through calls" pattern as `Core/Grid.jl`'s
 `BranchNetwork`, not a new global). Branch filenames use Windows-style
 backslashes (`inputs\\QIN_....csv`) in the real control files --
 normalized to the platform path separator via `joinpath` on the split
@@ -299,6 +312,7 @@ function load_boundary_conditions(con_path::AbstractString, base_dir::AbstractSt
     inflow = Dict{Int,@NamedTuple{qin::BoundarySeries, tin::BoundarySeries}}()
     outflow = Dict{Int,BoundarySeries}()
     dist_trib = Dict{Int,BoundarySeries}()
+    dist_trib_temp = Dict{Int,BoundarySeries}()
     for jb in 1:g.NBR
         if g.UP_FLOW[jb]
             qf, tf = fn.qinfn[jb], fn.tinfn[jb]
@@ -321,9 +335,14 @@ function load_boundary_conditions(con_path::AbstractString, base_dir::AbstractSt
                 dpath = joinpath(base_dir, split(df, '\\')...)
                 dist_trib[jb] = read_boundary_series(dpath)
             end
+            tdf = fn.tdtfn[jb]
+            if !isempty(tdf)
+                tdpath = joinpath(base_dir, split(tdf, '\\')...)
+                dist_trib_temp[jb] = read_boundary_series(tdpath)
+            end
         end
     end
-    return (inflow = inflow, outflow = outflow, dist_trib = dist_trib)
+    return (inflow = inflow, outflow = outflow, dist_trib = dist_trib, dist_trib_temp = dist_trib_temp)
 end
 
 """
@@ -331,13 +350,14 @@ end
 
 Sets `g.QIN[jb]`/`g.QIND[jb]`/`g.TIN[jb]`/`g.TIND[jb]` for every branch in
 `boundary.inflow`, `g.QOT[jb]` for every branch in `boundary.outflow`, and
-`g.QDTR[jb]` for every branch in `boundary.dist_trib` (from
-`load_boundary_conditions`) at the given `jday`. Call once per timestep,
-before `Hydrodynamics/FreeSurface.jl`'s `solve_free_surface!` (and before
-`distribute_tributary!`, which actually applies `QDTR` into `QSS`). `QIN==
-QIND`/`TIN==TIND` here (see `Core/State.jl`'s QIN/QIND docstring for why --
-the INTERNAL_FLOW/DAM_INFLOW cases that would make them differ aren't
-ported).
+`g.QDTR[jb]`/`g.TDTR[jb]` for every branch in `boundary.dist_trib`/
+`boundary.dist_trib_temp` (from `load_boundary_conditions`) at the given
+`jday`. Call once per timestep, before `Hydrodynamics/FreeSurface.jl`'s
+`solve_free_surface!` (and before `distribute_tributary!`, which actually
+applies `QDTR` into `QSS`, and before `Hydrodynamics/Transport.jl`'s
+`apply_temperature_sources!`, which reads `TDTR`). `QIN==QIND`/`TIN==TIND`
+here (see `Core/State.jl`'s QIN/QIND docstring for why -- the INTERNAL_FLOW/
+DAM_INFLOW cases that would make them differ aren't ported).
 """
 function update_boundary_conditions!(g, boundary, jday::Real)
     for (jb, series) in boundary.inflow
@@ -351,6 +371,9 @@ function update_boundary_conditions!(g, boundary, jday::Real)
     end
     for (jb, series) in boundary.dist_trib
         g.QDTR[jb] = interpolate_series(series, jday)
+    end
+    for (jb, series) in boundary.dist_trib_temp
+        g.TDTR[jb] = interpolate_series(series, jday)
     end
     return g
 end
