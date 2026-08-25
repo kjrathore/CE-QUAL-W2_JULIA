@@ -61,6 +61,16 @@ detection. CRITICAL: includes `H2`/`BH2`/`BHR2`/`AVH2` (the "old" geometry
 arrays), not just `H1`/`BH1`/... (the "new" ones) -- `hydrodynamic_step!`'s
 own `H2 .= H1` swap at the top of a retried call would otherwise re-swap
 from the FAILED step's `H1`, corrupting the "old" baseline for the retry.
+
+Also includes `TKE`/`AZ`/`DZ`/`AZT` (`Hydrodynamics/Turbulence.jl`'s
+`calculate_tke!`, added 2026-08-24, AFTER this struct was first written --
+a real gap found while wiring adaptive stepping into `Simulation.jl`'s
+`run_forced_simulation!` the same day, not by a failing test): `calculate_
+tke!` runs inside `hydrodynamic_step!` and its TKE update is an explicit
+`TKE[k,i,1] += dlt*(...)` INCREMENT, not a fresh recomputation -- without
+snapshotting/restoring it, a failed attempt's partial TKE advance would
+silently carry into the retry attempt and get double-counted, corrupting
+`AZ`/`DZ` (and therefore the CFL check itself) on every retry.
 """
 struct HydroSnapshot
     Z::Vector{Float64}; ELWS::Vector{Float64}
@@ -71,6 +81,7 @@ struct HydroSnapshot
     AVH1::Matrix{Float64}; AVH2::Matrix{Float64}
     VOL::Matrix{Float64}
     BI::Matrix{Float64}; BKT::Vector{Float64}
+    TKE::Array{Float64,3}; AZ::Matrix{Float64}; DZ::Matrix{Float64}; AZT::Matrix{Float64}
 end
 
 """
@@ -85,7 +96,8 @@ function snapshot_hydro_state(g, geom)
     HydroSnapshot(copy(geom.Z), copy(geom.ELWS), copy(g.U),
                   copy(geom.H1), copy(geom.H2), copy(geom.BH1), copy(geom.BH2),
                   copy(geom.BHR1), copy(geom.BHR2), copy(geom.AVH1), copy(geom.AVH2),
-                  copy(g.VOL), copy(geom.BI), copy(geom.BKT))
+                  copy(g.VOL), copy(geom.BI), copy(geom.BKT),
+                  copy(g.TKE), copy(g.AZ), copy(g.DZ), copy(g.AZT))
 end
 
 """
@@ -102,6 +114,7 @@ function restore_hydro_state!(g, geom, s::HydroSnapshot)
     geom.BH1 .= s.BH1; geom.BH2 .= s.BH2
     geom.BHR1 .= s.BHR1; geom.BHR2 .= s.BHR2
     geom.AVH1 .= s.AVH1; geom.AVH2 .= s.AVH2
+    g.TKE .= s.TKE; g.AZ .= s.AZ; g.DZ .= s.DZ; g.AZT .= s.AZT
     g.VOL .= s.VOL
     geom.BI .= s.BI; geom.BKT .= s.BKT
     return (g, geom)

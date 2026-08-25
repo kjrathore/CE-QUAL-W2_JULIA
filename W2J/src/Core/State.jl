@@ -189,7 +189,10 @@ mutable struct W2Global
     # elsewhere in this codebase; same reasoning applies here from the
     # start instead of being retrofitted later). ---
     W::Matrix{Float64}    # vertical velocity -- NOT YET COMPUTED (continuity-derived; not ported), always 0
-    DZ::Matrix{Float64}   # vertical eddy diffusivity -- NOT YET COMPUTED (needs Turbulence.jl); reduced-physics: caller-set uniform value
+    AZ::Matrix{Float64}   # vertical eddy VISCOSITY (momentum) -- REAL (Hydrodynamics/Turbulence.jl's calculate_tke!, 2026-08-24, AZC='TKE' closure)
+    DZ::Matrix{Float64}   # vertical eddy DIFFUSIVITY (mass/heat) -- REAL as of 2026-08-24 (calculate_tke!: DZ = max(DZMIN, FRAZDZ*AZ)), previously a caller-set uniform value
+    TKE::Array{Float64,3} # turbulent kinetic energy + dissipation rate, KMX x IMX x 2 (real Fortran's TKE(K,I,1:2)) -- az.f90's CALCULATE_TKE state
+    AZT::Matrix{Float64}  # AZ before vertical interface-averaging (az.f90: AZT(K,I) = 0.09*TKE1^2/TKE2, then AZ(K,I)=0.5*(AZT(K,I)+AZT(K+1,I)))
     DX::Matrix{Float64}   # horizontal dispersion coefficient -- NOT YET COMPUTED (needs DXI, Tier 1 IO); reduced-physics: caller-set
     SF1X::Vector{Float64} # transport.f90 INTERPOLATION_MULTIPLIERS -- (DLX(I+1)+DLX(I))/2, per segment (IMX). Declared KMX x IMX in
                           # Fortran but every assignment's RHS is K-independent -- collapsed to a per-segment vector here, same
@@ -288,7 +291,10 @@ function W2Global()
         zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0),   # U, RHO, P, HPG, GRAV
         zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0),   # SB, ST, ADMX, ADMZ, DM
         Float64[],                                                         # DLXRHO
-        zeros(0, 0), zeros(0, 0), zeros(0, 0),                            # W, DZ, DX
+        zeros(0, 0),                                                       # W
+        zeros(0, 0), zeros(0, 0),                                         # AZ, DZ
+        zeros(0, 0, 0), zeros(0, 0),                                      # TKE, AZT
+        zeros(0, 0),                                                      # DX
         Float64[], zeros(0, 0), zeros(0, 0),                              # SF1X, ADX, ADZ
         zeros(0, 0), zeros(0, 0), zeros(0, 0), zeros(0, 0),               # AT, CT, VT, DT
         zeros(0, 0, 0), zeros(0, 0, 0),

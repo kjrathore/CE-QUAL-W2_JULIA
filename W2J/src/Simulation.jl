@@ -94,18 +94,28 @@ set `geom.THETA`/`geom.UPWIND`/`geom.ULTIMATE` (Tier 1, not read by
 transport state itself, matching `run_zero_flow_sanity_check!`'s existing
 "caller allocates, this function only steps" convention.
 
-Same `dlt = tc.DLTMAX[1]` fixed-timestep reduced physics as `run_zero_flow_
-sanity_check!` -- see that function's module docstring for why the real
-adaptive-timestep machinery isn't ported yet. Constituent transport
-(`constituent_transport!`) is NOT called here -- temperature only, matching
-this port's current Tier-1 boundary IO scope (QIN/TIN/QOT/QDTR/TDTR, no
-`CIN` constituent loading yet).
+Uses `Hydrodynamics/AdaptiveTimestep.jl`'s `step_hydrodynamics_adaptive!`
+as of 2026-08-24 (previously a single fixed `dlt = tc.DLTMAX[1]`) --
+motivated by a REAL, found-not-guessed instability: once `Hydrodynamics/
+Turbulence.jl`'s real TKE closure went in, its correctly-computed (given
+no wind/friction forcing yet, see that file's module docstring) near-floor
+`DZ` exposed that the explicit UPWIND advection scheme is NOT
+unconditionally stable at `DLTMAX=200s` -- `T2` blew up to `>99°C` around
+`jday≈4.125` in a real DET-forced run before this was wired in. The
+previous placeholder constant `DZ` had been accidentally providing enough
+numerical damping to mask this. `AdaptiveTimestepState` is created and
+owned internally here (unlike hydro/transport state, which the caller
+allocates) since it's intrinsic to this function's own timestepping loop,
+not shared with any other driver. `constituent_transport!` is NOT called
+here -- temperature only, matching this port's current Tier-1 boundary IO
+scope (QIN/TIN/QOT/QDTR/TDTR, no `CIN` constituent loading yet).
 
 Returns `(g, geom, jday_final)`.
 """
 function run_forced_simulation!(g, geom, net, tc, boundary; nsteps::Int, output_dir::AbstractString,
                                  output_segments::Vector{Int}, base_name::AbstractString="tsr")
-    dlt = tc.DLTMAX[1]
+    state = init_adaptive_timestep(tc)
+    dlt = state.dlt
     jday = tc.TMSTRT
 
     writer = OutputWriter.open_tsr_files(output_dir, base_name, output_segments; include_temp=true)
@@ -113,12 +123,12 @@ function run_forced_simulation!(g, geom, net, tc, boundary; nsteps::Int, output_
         OutputWriter.write_tsr_row!(writer, g, geom, jday, dlt)  # initial condition
         for _ in 1:nsteps
             BoundaryReader.update_boundary_conditions!(g, boundary, jday)
-            hydrodynamic_step!(g, geom, net, dlt)
+            accepted_dlt, _ = step_hydrodynamics_adaptive!(g, geom, net, tc, state, jday)
             apply_temperature_sources!(g, geom)
-            temperature_transport!(g, geom, dlt)
+            temperature_transport!(g, geom, accepted_dlt)
             g.HYD[:, :, 4] .= g.T1
-            jday += dlt / 86400.0
-            OutputWriter.write_tsr_row!(writer, g, geom, jday, dlt)
+            jday += accepted_dlt / 86400.0
+            OutputWriter.write_tsr_row!(writer, g, geom, jday, accepted_dlt)
         end
     finally
         OutputWriter.close_tsr_files!(writer)

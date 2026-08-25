@@ -150,6 +150,16 @@ function allocate_hydro_state!(g)
     # this function only takes `g`, not `geom`, so it can't size a
     # W2Geometry field itself without changing every existing call site's
     # signature (a much larger, unrelated churn for a one-line default).
+    #
+    # AZ/DZ/TKE/AZT: calculate_tke! also runs unconditionally inside every
+    # hydrodynamic_step! call (same reasoning as DIST_TRIBS above), and
+    # these fields all live on `g` (not `geom`), so -- unlike PLACE_QIN --
+    # they CAN be sized here directly. Hydrodynamics/Turbulence.jl's
+    # allocate_turbulence_state! also inits TKE to (TKEMIN1,TKEMIN2) and AZ
+    # to AZMIN, not zero -- see that function's docstring for why (avoids a
+    # 0/0 in calculate_tke!'s dissipation-ratio term on the very first
+    # call).
+    allocate_turbulence_state!(g)
     return g
 end
 
@@ -796,8 +806,26 @@ runs right after `solve_free_surface!` since it needs the freshly solved
 `geom.Z` -- see that function's docstring for what was found missing (real,
 not speculative: `H1`/`BH1`/`BHR1`/`AVH1` were frozen at their init values
 forever until this was added, 2026-08-23).
+
+`geom.BHRATIO .= geom.BH2 ./ geom.BH1` runs BEFORE the swap (same real
+`update.F90:51` line, computed immediately before that line's own
+`BH2(K,I)=BH1(K,I)`) -- real Fortran's comment there is literally "USED FOR
+TKE COMPUTATION" (`Hydrodynamics/Turbulence.jl`'s `calculate_tke!` reads
+`geom.BHRATIO[kt,i]`). Computed array-wide via broadcast rather than only
+at `[kt,i]` (matching real Fortran's own `K=KT,KB(I)` range, in case a
+future closure needs other `K`) -- may produce `NaN`/`Inf` at dry/inactive
+positions where `BH1==0`, harmless since nothing reads `BHRATIO` there.
+
+`calculate_tke!` runs LAST, after `update_velocities!` -- needs this step's
+just-solved `U` (shear production) and `compute_density_field!`'s `RHO`
+(buoyancy damping, already current from earlier in this same call). Writes
+`AZ`/`DZ` for `Hydrodynamics/Transport.jl` to read on the NEXT call (e.g.
+`apply_temperature_sources!`/`temperature_transport!`, called by
+`Simulation.jl`'s `run_forced_simulation!` right after this function
+returns in the same timestep).
 """
 function hydrodynamic_step!(g, geom, net, dlt)
+    geom.BHRATIO .= geom.BH2 ./ geom.BH1
     geom.H2 .= geom.H1
     geom.BH2 .= geom.BH1
     geom.BHR2 .= geom.BHR1
@@ -815,5 +843,6 @@ function hydrodynamic_step!(g, geom, net, dlt)
     apply_inflow_boundary!(g, geom, dlt)
     compute_horizontal_advection_of_momentum!(g, geom)
     update_velocities!(g, geom, dlt)
+    calculate_tke!(g, geom, dlt)
     return (g, geom)
 end
