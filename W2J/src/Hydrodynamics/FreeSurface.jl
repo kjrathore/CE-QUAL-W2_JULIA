@@ -843,6 +843,7 @@ function hydrodynamic_step!(g, geom, net, dlt)
     apply_inflow_boundary!(g, geom, dlt)
     compute_horizontal_advection_of_momentum!(g, geom)
     update_velocities!(g, geom, dlt)
+    compute_wind_stress!(g, geom)
     calculate_tke!(g, geom, dlt)
     return (g, geom)
 end

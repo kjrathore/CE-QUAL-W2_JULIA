@@ -401,6 +401,55 @@ end
         @test all(isfinite, g.U[:, 2:30])
     end
 
+    @testset "Hydrodynamics/Turbulence: compute_wind_stress!, IO/MetReader" begin
+        detroit = joinpath(@__DIR__, "..", "..", "DetroitReservoir")
+        g, geom, tc = W2J.InputReader.read_control_file(joinpath(detroit, "w2_con.csv"); debug=false)
+        W2J.InputReader.allocate_geometry!(g, geom)
+        W2J.BathymetryReader.read_bathymetry!(geom, g, joinpath(detroit, "InputFiles", "bth1.csv"), 1; debug=false)
+        g, geom, net = W2J.init_geometry!(g, geom)
+        W2J.compute_dlxrho!(g, geom)
+        W2J.allocate_hydro_state!(g)
+
+        # --- compute_wind_stress!: a real, meaningful wind must produce a
+        # nonzero WIND10/CZ/USTAR -- matches the real piecewise CZ formula
+        # exactly at a known breakpoint (4 <= WIND10 < 15: CZ=0.0005*sqrt(WIND10)) ---
+        seg = g.CUS[1]
+        kt = g.KTWB[1]
+        g.WIND[1] = 10.0
+        W2J.compute_wind_stress!(g, geom)
+        @test g.WIND10[seg] == 10.0
+        @test isapprox(g.CZ[seg], 0.0005 * sqrt(10.0); atol=1e-12)
+        g.RHO[kt, seg] = 999.9
+        ustar = sqrt(1.25 * g.CZ[seg] * g.WIND10[seg]^2 / g.RHO[kt, seg])
+        @test ustar > 0
+
+        # --- zero wind (the safe default) must leave WIND10 at 0 and CZ at
+        # the real formula's own "<0.5" floor branch (0.01), not silently
+        # skip recomputing CZ from a stale nonzero WIND10 ---
+        g.WIND[1] = 0.0
+        W2J.compute_wind_stress!(g, geom)
+        @test g.WIND10[seg] == 0.0
+        @test g.CZ[seg] == 0.01
+
+        # --- IO/MetReader.jl: read_met_series + interpolate_met, synthetic
+        # fixture matching the real $-format convention ---
+        tmp = mktempdir()
+        met_path = joinpath(tmp, "MET_test.csv")
+        write(met_path, """
+            \$ Test met,
+            # synthetic fixture,
+            JDAY,TAIR.C,TDEW.C,WS.MS,WD.RAD,CLOUD,GHI.WM2
+            1,10.0,5.0,2.0,1.0,0.5,100.0
+            2,12.0,6.0,4.0,1.2,0.6,120.0
+            """)
+        series = W2J.MetReader.read_met_series(met_path)
+        @test series.jday == [1.0, 2.0]
+        @test series.wind == [2.0, 4.0]
+        tair, tdew, wind, phi, cloud, sro = W2J.MetReader.interpolate_met(series, 1.5)
+        @test isapprox(wind, 3.0; atol=1e-9)   # halfway between 2.0 and 4.0
+        @test isapprox(tair, 11.0; atol=1e-9)
+    end
+
     @testset "Core/Parallel: parallel_foreach" begin
         # threshold=0 forces the Threads.@threads branch; threshold=typemax
         # forces the serial branch -- both must visit every index exactly

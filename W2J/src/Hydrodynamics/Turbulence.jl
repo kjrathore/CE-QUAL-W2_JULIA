@@ -16,11 +16,14 @@
 # directly (context: MANN->FRICC, 0.001->Z0, then the real AZC/AZSLC/AZMAX/
 # TKEBC/EROUGH/ARODI read order from input.F90:832-837 matches exactly).
 #
-# REDUCED PHYSICS, confirmed with user (2026-08-24) as "port now, MET
-# later" rather than blocking on new Tier-1 IO first:
-# - The surface boundary-condition term (`USTAR`, wind-driven) needs
-#   `WIND10(I)`/`CZ(I)` -- meteorology, Tier 1, `MET.csv` not read by this
-#   port at all. `USTAR = 0` here (no wind forcing).
+# REDUCED PHYSICS:
+# - The surface boundary-condition term (`USTAR`, wind-driven) is now REAL
+#   as of 2026-09-10 -- `IO/MetReader.jl` reads real `MET.csv` wind speed
+#   and `compute_wind_stress!` derives `WIND10(I)`/`CZ(I)` from it (see
+#   that function's own docstring for its own, smaller reductions: no
+#   log-law height rescale, no fetch correction, `WSC(I)=1`). Before this,
+#   `USTAR` was hardcoded to 0 (confirmed with user 2026-08-24 as "port TKE
+#   now, MET later").
 # - The bottom boundary-condition term and the interior lateral-friction
 #   production terms (`PRHE`/`PRHK`) all need `GC2 = G/FRIC(I)^2`, which
 #   needs `FRIC(I)` (per-segment bottom friction, Tier 1, not read) or
@@ -28,15 +31,13 @@
 #   an invented shortcut: real Fortran's own `IF (FRIC(I) /= 0.0) GC2 = ...`
 #   branch literally produces `GC2 = 0.0` whenever `FRIC(I) == 0.0`, so
 #   this reduction lands on a real, Fortran-supported code path, not a new
-#   one.
-# - Net effect: TKE production in this port comes ONLY from interior
-#   velocity shear (`PRDK`) and is damped only by buoyancy (`BOUK`) and its
-#   own dissipation -- no wind-driven surface mixing, no bottom-friction
-#   turbulence generation. In a real reservoir wind is often the dominant
-#   surface-mixing mechanism, so this is a real, flagged limitation, not
-#   claimed to be a complete turbulence closure -- still likely more
-#   physically grounded than a spatially-uniform constant DZ, since it at
-#   least responds to real local velocity shear and stratification.
+#   one. STILL NOT PORTED (unlike wind, above).
+# - Net effect: TKE production now comes from BOTH interior velocity shear
+#   (`PRDK`) AND real wind-driven surface production, damped by buoyancy
+#   (`BOUK`) and dissipation -- still no bottom-friction turbulence
+#   generation (needs `FRIC`, above). Wind is usually the dominant real
+#   surface-mixing mechanism in a reservoir, so this closes the single
+#   biggest gap flagged when this file was first written.
 #
 # NOT PORTED: `CALCULATE_TKE1`, the non-TKE algebraic closures, `TKELATPRD`
 # lateral-friction production (needs the same missing FRIC data),
@@ -119,6 +120,70 @@ function allocate_turbulence_state!(g)
     # on/off switch like DIST_TRIBS/PLACE_QIN -- a generous default is
     # unlikely to ever bind, not a silent accuracy gap in the same way.
     isempty(g.AZMAX) && (g.AZMAX = fill(100.0, g.NWB))
+    # Meteorology (IO/MetReader.jl) -- same "unconditional inner call"
+    # reasoning as DIST_TRIBS/PLACE_QIN: compute_wind_stress! runs inside
+    # every hydrodynamic_step! call (via calculate_tke!), so these must be
+    # sized here regardless of whether a caller ever loads real MET data.
+    # WIND=0 is the safe default (no wind forcing unless a caller explicitly
+    # loads+updates real MET conditions) -- same "off by default" discipline
+    # as QIN/QOT/QDTR. WSC=1.0 (no sheltering) is the real Fortran default
+    # absent a per-segment wind-sheltering file (Tier 1, not read).
+    isempty(g.WIND) && (g.WIND = zeros(Float64, g.NWB))
+    isempty(g.PHI) && (g.PHI = zeros(Float64, g.NWB))
+    isempty(g.TAIR) && (g.TAIR = zeros(Float64, g.NWB))
+    isempty(g.TDEW) && (g.TDEW = zeros(Float64, g.NWB))
+    isempty(g.CLOUD) && (g.CLOUD = zeros(Float64, g.NWB))
+    isempty(g.SRO) && (g.SRO = zeros(Float64, g.NWB))
+    isempty(g.WIND10) && (g.WIND10 = zeros(Float64, imx))
+    isempty(g.CZ) && (g.CZ = zeros(Float64, imx))
+    isempty(g.WSC) && (g.WSC = fill(1.0, imx))
+    return g
+end
+
+"""
+    compute_wind_stress!(g, geom)
+
+`w2_4_win.f90:601-632`'s "Adjusted wind speed and surface wind shear drag
+coefficient" block -- computes `WIND10(I)` (wind speed adjusted toward a
+10m reference) and `CZ(I)` (the wind drag coefficient), the two values
+`calculate_tke!`'s `USTAR` term consumes.
+
+REDUCED PHYSICS: the real `WIND10(I) = WIND(JW)*WSC(I)*ln(10/Z0(JW))/
+ln(WINDH(JW)/Z0(JW))` log-law height rescale needs `WINDH(JW)` (the
+height at which wind was measured) and `Z0(JW)` (surface roughness) --
+both Tier 1, not read by `InputReader.jl`. Here `WIND10(I) = WIND(JW)*
+WSC(I)` (the rescale factor dropped, i.e. assumed `== 1`), a reasonable
+assumption for real DET's `MET.csv` (a NASA POWER API export -- POWER's
+WS10M product is already a 10m reference value, so a real WINDH=10/Z0
+rescale would very nearly cancel anyway). The `FETCH_CALC(JW)` fetch-based
+correction (needs per-segment fetch distances, Tier 1) is also NOT
+applied. `CZ(I)`'s own piecewise formula has no Tier-1 dependency and is
+ported exactly.
+
+Call once per timestep, before `calculate_tke!` (needs current `WIND10`/
+`CZ`) and after `IO/MetReader.jl`'s `update_met_conditions!` (needs
+current `g.WIND`).
+"""
+function compute_wind_stress!(g, geom)
+    for jw in 1:g.NWB
+        for jb in g.BS[jw]:g.BE[jw]
+            g.BR_INACTIVE[jb] && continue
+            iu, id = g.CUS[jb], g.DS[jb]
+            for i in max(1, iu-1):min(g.IMX, id+1)
+                wind10 = g.WIND[jw] * g.WSC[i]
+                g.WIND10[i] = wind10
+                g.CZ[i] = if wind10 >= 15.0
+                    0.0026
+                elseif wind10 >= 4.0
+                    0.0005 * sqrt(wind10)
+                elseif wind10 >= 0.5
+                    0.0044 * wind10^(-1.15)
+                else
+                    0.01
+                end
+            end
+        end
+    end
     return g
 end
 
@@ -157,8 +222,10 @@ function calculate_tke!(g, geom, dlt)
             for i in iu:id
                 kb = g.KB[i]
 
-                gc2 = 0.0     # FRIC(I)/MANNINGS_N(JW) not read -- see module docstring
-                ustar = 0.0   # WIND10(I)/CZ(I) not read (MET Tier 1) -- see module docstring
+                gc2 = 0.0     # FRIC(I)/MANNINGS_N(JW) still not read -- see module docstring
+                # USTAR: real formula, now using real WIND10(I)/CZ(I) (IO/MetReader.jl +
+                # compute_wind_stress!, 2026-09-10) -- previously always 0 (no MET at all).
+                ustar = sqrt(1.25 * g.CZ[i] * g.WIND10[i]^2 / g.RHO[kt, i])
                 ustarbkt = sqrt(gc2) * abs(0.5 * (g.U[kt, i] + g.U[kt, i-1]))
                 g.TKE[kt, i, 1] = (3.33 * (ustar^2 + ustarbkt^2)) * geom.BHRATIO[kt, i]
                 g.TKE[kt, i, 2] = (ustar^3 + ustarbkt^3) * 5.0 / geom.H1[kt, i] * geom.BHRATIO[kt, i]

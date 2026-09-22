@@ -104,6 +104,26 @@ mutable struct W2Global
     CMULT::Vector{Float64}; CDMULT::Vector{Float64}; WIND2::Vector{Float64}
     AZMAX::Vector{Float64}; PALT::Vector{Float64}; Z0::Vector{Float64}
 
+    # --- meteorology (Tier 1 boundary IO, IO/MetReader.jl), per waterbody
+    # (NWB). WIND/PHI/TAIR/TDEW/CLOUD/SRO are the CURRENT (this-timestep,
+    # interpolated) values, matching real Fortran's own field names exactly
+    # (time-varying-data.f90's WINDNX/PHINX/TAIRNX/TDEWNX/CLOUDNX/SRONX
+    # interpolated into WIND/PHI/TAIR/TDEW/CLOUD/SRO). Only WIND is
+    # consumed so far (Hydrodynamics/Turbulence.jl's compute_wind_stress!,
+    # feeding calculate_tke!'s wind-driven surface TKE term) -- the rest
+    # are loaded for a future real heat-exchange module (heat-exchange.f90,
+    # still a stub), not yet read by anything. ---
+    WIND::Vector{Float64}; PHI::Vector{Float64}
+    TAIR::Vector{Float64}; TDEW::Vector{Float64}
+    CLOUD::Vector{Float64}; SRO::Vector{Float64}
+
+    # --- per-segment wind stress derived quantities (w2_4_win.f90:601-632),
+    # IMX-length. WIND10/CZ are consumed directly by calculate_tke!; WSC
+    # (per-segment wind-sheltering coefficient, Tier 1, not read by
+    # InputReader.jl) defaults to 1.0 (no sheltering) -- see Hydrodynamics/
+    # Turbulence.jl's compute_wind_stress! docstring for the full reduction. ---
+    WIND10::Vector{Float64}; CZ::Vector{Float64}; WSC::Vector{Float64}
+
     QSS::Matrix{Float64}; VOLUH2::Matrix{Float64}; VOLDH2::Matrix{Float64}
     QUH1::Matrix{Float64}; QDH1::Matrix{Float64}
     UXBR::Matrix{Float64}; UYBR::Matrix{Float64}; VOL::Matrix{Float64}
@@ -278,6 +298,8 @@ function W2Global()
         Float64[], Float64[], Float64[],
         Float64[], Float64[], Float64[],
         Float64[], Float64[], Float64[],
+        Float64[], Float64[], Float64[], Float64[], Float64[], Float64[],  # WIND, PHI, TAIR, TDEW, CLOUD, SRO
+        Float64[], Float64[], Float64[],                                    # WIND10, CZ, WSC
         zeros(0, 0), zeros(0, 0), zeros(0, 0),
         zeros(0, 0), zeros(0, 0),
         zeros(0, 0), zeros(0, 0), zeros(0, 0),

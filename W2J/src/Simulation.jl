@@ -110,10 +110,21 @@ not shared with any other driver. `constituent_transport!` is NOT called
 here -- temperature only, matching this port's current Tier-1 boundary IO
 scope (QIN/TIN/QOT/QDTR/TDTR, no `CIN` constituent loading yet).
 
+`met` is `IO/MetReader.jl`'s `load_met_conditions` return value
+(`Dict{Int,MetSeries}`, keyed by waterbody), optional (default `nothing`,
+2026-09-10) -- when given, `MetReader.update_met_conditions!` runs each
+step BEFORE `hydrodynamic_step!`/`step_hydrodynamics_adaptive!` (which
+call `Hydrodynamics/Turbulence.jl`'s `compute_wind_stress!`/
+`calculate_tke!` internally, so `g.WIND` must already be current for this
+step). Omitting `met` leaves `g.WIND` at its safe zero default (no wind
+forcing) -- same "off unless a caller explicitly loads real data"
+discipline as `boundary`'s QIN/QOT/QDTR.
+
 Returns `(g, geom, jday_final)`.
 """
 function run_forced_simulation!(g, geom, net, tc, boundary; nsteps::Int, output_dir::AbstractString,
-                                 output_segments::Vector{Int}, base_name::AbstractString="tsr")
+                                 output_segments::Vector{Int}, base_name::AbstractString="tsr",
+                                 met=nothing)
     state = init_adaptive_timestep(tc)
     dlt = state.dlt
     jday = tc.TMSTRT
@@ -123,6 +134,7 @@ function run_forced_simulation!(g, geom, net, tc, boundary; nsteps::Int, output_
         OutputWriter.write_tsr_row!(writer, g, geom, jday, dlt)  # initial condition
         for _ in 1:nsteps
             BoundaryReader.update_boundary_conditions!(g, boundary, jday)
+            met !== nothing && MetReader.update_met_conditions!(g, met, jday)
             accepted_dlt, _ = step_hydrodynamics_adaptive!(g, geom, net, tc, state, jday)
             apply_temperature_sources!(g, geom)
             temperature_transport!(g, geom, accepted_dlt)
