@@ -71,6 +71,16 @@ tke!` runs inside `hydrodynamic_step!` and its TKE update is an explicit
 snapshotting/restoring it, a failed attempt's partial TKE advance would
 silently carry into the retry attempt and get double-counted, corrupting
 `AZ`/`DZ` (and therefore the CFL check itself) on every retry.
+
+Also includes `KTI` (`g.KTI`, `Vector{Int}`) -- added 2026-09-22 alongside
+`Hydrodynamics/FreeSurface.jl`'s `recompute_top_layer_geometry!` KTI
+crossing-adjustment port, same class of gap as the TKE one above: `KTI`
+was static (never mutated) when this struct was first written, so it
+wasn't snapshotted; now `recompute_top_layer_geometry!` can genuinely
+advance it mid-timestep, and a failed retry attempt's advance must be
+undone before the next attempt, or the retry would start from the WRONG
+tracked sub-layer (and, via the `Z`-rescaling that accompanies a `KTI`
+change, a wrong `Z` too -- though `Z` itself is already snapshotted above).
 """
 struct HydroSnapshot
     Z::Vector{Float64}; ELWS::Vector{Float64}
@@ -82,6 +92,7 @@ struct HydroSnapshot
     VOL::Matrix{Float64}
     BI::Matrix{Float64}; BKT::Vector{Float64}
     TKE::Array{Float64,3}; AZ::Matrix{Float64}; DZ::Matrix{Float64}; AZT::Matrix{Float64}
+    KTI::Vector{Int}
 end
 
 """
@@ -97,7 +108,8 @@ function snapshot_hydro_state(g, geom)
                   copy(geom.H1), copy(geom.H2), copy(geom.BH1), copy(geom.BH2),
                   copy(geom.BHR1), copy(geom.BHR2), copy(geom.AVH1), copy(geom.AVH2),
                   copy(g.VOL), copy(geom.BI), copy(geom.BKT),
-                  copy(g.TKE), copy(g.AZ), copy(g.DZ), copy(g.AZT))
+                  copy(g.TKE), copy(g.AZ), copy(g.DZ), copy(g.AZT),
+                  copy(g.KTI))
 end
 
 """
@@ -117,6 +129,7 @@ function restore_hydro_state!(g, geom, s::HydroSnapshot)
     g.TKE .= s.TKE; g.AZ .= s.AZ; g.DZ .= s.DZ; g.AZT .= s.AZT
     g.VOL .= s.VOL
     geom.BI .= s.BI; geom.BKT .= s.BKT
+    g.KTI .= s.KTI
     return (g, geom)
 end
 

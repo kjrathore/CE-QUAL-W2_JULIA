@@ -482,19 +482,31 @@ init code IS the reference translation of this same real Fortran block.
 REDUCED PHYSICS, first cut (user authorized starting this port 2026-08-23;
 these specific simplifications are this port's own scoping call, flagged
 here rather than confirmed line-by-line, same discipline as INTERP_INFLOW):
-- No `KTI(I)` DO-WHILE crossing adjustment (w2_4_win.f90:1028-1044) -- this
-  port assumes `Z` stays within the SAME discrete bathymetry sub-layer
-  `g.KTI[i]` was assigned at init for the whole run. Reasonable for the
-  small `ELWS` excursions (order 0.01-0.5m) seen in every validation run so
-  far, wrong once a real multi-year forced run pushes `Z` across a whole
-  sub-layer boundary -- port the crossing adjustment before trusting a
-  long, strongly-forced run.
 - No `CONSTRICTION`/`BCONSTRICTION` correction -- already a no-op
   elsewhere in this port (`Core/InitGeometry.jl`: "CONSTRICTION not
   ported... always false"), consistent here.
 - No `KBI(I) < KB(I)` thin-bottom-layer correction to `BKT`/`AVHR` --
   `Core/State.jl`'s `KBI` field exists but this port doesn't yet use it;
   flagged, not silently applied.
+
+`KTI(I)` DO-WHILE crossing adjustment (w2_4_win.f90:1028-1044) -- PORTED
+2026-09-22, was previously deferred as "Z stays within the same sub-layer
+the whole run", confirmed WRONG by a real, found-not-guessed failure: a
+full real-forced 2017 DET run pushed segment 44's `Z` past its tracked
+`KTI` sub-layer's bottom (a genuine multi-day net outflow-driven ELWS
+decline, not a data anomaly -- checked real QIN/QOT/MET around the failure
+time, all smooth), and without this adjustment `BH1` went NEGATIVE instead
+of `KTI` incrementing -- corrupting `compute_curmax` (which started
+returning NEGATIVE "stability limits", stalling the adaptive-timestep
+retry loop at `DLTMIN` without ever actually stabilizing) and the
+transport/TKE TRIDIAG systems (dividing by a negative `BH1`), producing a
+catastrophic blow-up (`T1` reaching `~1e170`) within about a day of the
+underlying crossing event. Ported directly, both real branches (`KTI`
+decrementing as the surface rises above the tracked sub-layer's top,
+`KTI` incrementing as it drops below the sub-layer's bottom), including
+the real `Z`-rescaling formula in each `DO WHILE` iteration (needed so the
+newly-adopted sub-layer's own width `B(KTI,I)` is consistently reflected
+in `Z`, not just the index).
 
 MUST be called after `solve_free_surface!` (needs the new `geom.Z`) and
 before anything that reads `H1`/`BH1`/`BHR1`/`AVH1` for the CURRENT step
@@ -503,7 +515,51 @@ before anything that reads `H1`/`BH1`/`BHR1`/`AVH1` for the CURRENT step
 `update.F90` "old<-new" swap (`H2=H1` etc., done ONCE per timestep before
 the new Z-solve) is `hydrodynamic_step!`'s job, not this function's --
 this function only ever WRITES the "1" (new) arrays.
+
+`H1_FLOOR` dry-cell stopgap -- added 2026-09-23, found via a real (not
+hypothetical) full-2017-DET-forcing failure at segment 9 (a shallow,
+2-layer headwater segment right at the branch-1 inflow boundary): its
+water surface settled almost exactly at the bottom of its own top active
+layer (`Z` within `~1e-4` of `H(KT,JW)`), and one more timestep's tiny
+numerical overshoot pushed `Z` a hair past it, making `H1[KT,I] =
+H(KT,JW)-Z(I)` go NEGATIVE by a razor-thin margin -- even though `dlt` was
+already pinned at `DLTMIN` (the adaptive-timestep retry loop, correctly,
+could not shrink `dlt` any further). Real Fortran treats exactly this
+condition ("negative surface-layer thickness" even at `DLTMIN`) as a
+genuine dry-cell/branch-deactivation case, handled by
+`layeraddsub.F90`'s branch add/subtract + reactivation logic -- NOT
+ported in this project (flagged as a gap since 2026-08-23,
+`Hydrodynamics/AdaptiveTimestep.jl`'s own module docstring). Without it,
+the tiny negative `H1`/`BH1` propagated straight into the implicit
+velocity/free-surface TRIDIAG systems (which divide by `BH1`) and
+amplified exponentially within ~100 steps (`U` at the boundary pad went
+from `-0.89 m/s` to `-2060 m/s`) into a full NaN blow-up.
+
+Porting the real dry-cell/branch-reactivation machinery is a substantially
+larger, separate undertaking (confirmed with user via `AskUserQuestion`,
+2026-09-23) -- this floor is a deliberate, flagged STOPGAP instead (same
+discipline as `Hydrodynamics/Turbulence.jl`'s `DZ_STABILITY_FLOOR`, NOT a
+real Fortran constant): `geom.Z[I]` itself is clamped so `H1[KT,I] =
+H[KT,JW]-Z[I]` never drops below `H1_FLOOR` (1 cm), and `BH1[KT,I]` is
+correspondingly floored to never go below `H1_FLOOR*B[KT,I]`, so the
+implicit systems never divide by a non-positive `BH1` at this or any
+similarly razor-thin top layer. Clamping `Z` itself (not just the derived
+`H1`) matters: an earlier version of this fix floored only `H1`, leaving
+`Z` free to keep overshooting past the floor every step (each overshoot
+re-triggering the same floor) -- found via a real full-2017 run that,
+with that version, didn't diverge but instead STALLED (`compute_curmax`
+pinned near `DLTMIN` indefinitely, ~11 days of real progress consumed
+the entire step budget meant for 365). Clamping `Z` keeps `Z`/`ELWS`/`H1`/
+`BH1` mutually consistent, so once the real forcing balance at a floored
+segment changes, `Z` can recede back below the floor and normal dynamics
+resume. This changes the model's behavior only in the already-nonphysical
+regime this port cannot otherwise represent (a genuinely dry/near-dry top
+layer at a shallow segment) -- it does NOT reactivate a lower branch
+layer or otherwise reproduce the real dry-cell physics, just prevents the
+numerical blow-up (and, with the `Z` clamp, the timestep-pinning stall)
+that gap currently causes.
 """
+const H1_FLOOR = 0.01   # m -- dry-cell stopgap floor, see docstring above; NOT a real Fortran constant
 function recompute_top_layer_geometry!(g, geom)
     for jw in 1:g.NWB
         kt = g.KTWB[jw]
@@ -511,12 +567,43 @@ function recompute_top_layer_geometry!(g, geom)
             g.BR_INACTIVE[jb] && continue
             iu, id = g.CUS[jb], g.DS[jb]
             for i in (iu-1):(id+1)
+                # KTI crossing adjustment (w2_4_win.f90:1028-1044) -- MUST run
+                # before H1/BH1/etc below, since it can change both g.KTI[i]
+                # and geom.Z[i], and everything below reads the (possibly
+                # just-updated) values. See this function's docstring for the
+                # real failure this fixes.
+                if geom.EL[kt, i] - geom.Z[i] * geom.COSA[jb] > geom.EL[g.KTI[i], i]
+                    while geom.EL[kt, i] - geom.Z[i] * geom.COSA[jb] > geom.EL[g.KTI[i], i] && g.KTI[i] != 2
+                        geom.Z[i] = (geom.EL[kt, i] - geom.EL[g.KTI[i], i] -
+                                     (geom.EL[kt, i] - geom.EL[g.KTI[i], i] - geom.Z[i] * geom.COSA[jb]) *
+                                     (geom.B[g.KTI[i], i] / geom.B[g.KTI[i]-1, i])) / geom.COSA[jb]
+                        g.KTI[i] = max(g.KTI[i] - 1, 2)
+                    end
+                elseif geom.EL[kt, i] - geom.Z[i] * geom.COSA[jb] <= geom.EL[g.KTI[i]+1, i]
+                    while geom.EL[kt, i] - geom.Z[i] * geom.COSA[jb] <= geom.EL[g.KTI[i]+1, i] && g.KTI[i] < g.KB[i]
+                        geom.Z[i] = (geom.EL[kt, i] - geom.EL[g.KTI[i]+1, i] -
+                                     (geom.EL[kt, i] - geom.EL[g.KTI[i]+1, i] - geom.Z[i] * geom.COSA[jb]) *
+                                     (geom.B[g.KTI[i], i] / geom.B[g.KTI[i]+1, i])) / geom.COSA[jb]
+                        g.KTI[i] = g.KTI[i] + 1
+                        g.KTI[i] >= g.KB[i] && break
+                    end
+                end
                 kti = g.KTI[i]
+                # Clamp Z itself (not just the derived H1) so Z/ELWS/H1/BH1
+                # stay mutually consistent -- flooring H1 alone while leaving
+                # Z free let Z keep overshooting past the floor every step,
+                # which kept re-triggering the floor and pinned compute_curmax
+                # at DLTMIN indefinitely (found via a real full-2017 run that
+                # stalled after ~11 days instead of diverging OR recovering).
+                z_max = geom.H[kt, i] - H1_FLOOR
+                geom.Z[i] > z_max && (geom.Z[i] = z_max)
                 geom.H1[kt, i] = geom.H[kt, i] - geom.Z[i]
                 geom.AVH1[kt, i] = (geom.H1[kt, i] + geom.H1[kt+1, i]) * 0.5
 
                 bh1_kt = geom.B[kti, i] * (geom.EL[kt, i] - geom.EL[kti+1, i] - geom.Z[i] * geom.COSA[jb]) / geom.COSA[jb]
-                kt == kti && (bh1_kt = geom.H1[kt, i] * geom.B[kt, i])
+                (kt == kti || kti >= g.KB[i]) && (bh1_kt = geom.H1[kt, i] * geom.B[kt, i])
+                bh1_floor = H1_FLOOR * geom.B[kt, i]
+                bh1_kt < bh1_floor && (bh1_kt = bh1_floor)
                 for k in (kti+1):kt
                     bh1_kt += geom.BNEW[k, i] * geom.H[k, i]
                 end
@@ -524,6 +611,14 @@ function recompute_top_layer_geometry!(g, geom)
                 geom.BKT[i] = bh1_kt / geom.H1[kt, i]
                 geom.BI[kt, i] = geom.B[kti, i]
                 g.VOL[kt, i] = bh1_kt * geom.DLX[i]
+
+                # ELWS was already set once by solve_branch_free_surface! using
+                # the PRE-crossing-adjustment Z -- the real crossing formula
+                # above can rescale Z (a genuine physical adjustment across a
+                # discrete bathymetry sub-layer boundary, not just an index
+                # change, see this function's docstring), so ELWS must be
+                # recomputed here to stay consistent with the possibly-updated Z.
+                geom.ELWS[i] = geom.EL[kt, i] - geom.Z[i] * geom.COSA[jb]
             end
             for i in (iu-1):id
                 geom.AVHR[kt, i] = geom.H1[kt, i] + (geom.H1[kt, i+1] - geom.H1[kt, i]) * geom.DLX[i] / (geom.DLX[i] + geom.DLX[i+1])
