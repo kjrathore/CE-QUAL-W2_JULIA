@@ -36,6 +36,7 @@ include("Hydrodynamics/Transport.jl")
 include("Hydrodynamics/AdaptiveTimestep.jl")
 include("Hydrodynamics/Waterbody.jl")
 include("Hydrodynamics/Turbulence.jl")
+include("Hydrodynamics/HeatExchange.jl")
 include("Hydrodynamics/Structures.jl")
 
 include("WaterQuality/RateMultipliers.jl")

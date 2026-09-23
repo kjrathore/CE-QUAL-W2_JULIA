@@ -124,6 +124,19 @@ mutable struct W2Global
     # Turbulence.jl's compute_wind_stress! docstring for the full reduction. ---
     WIND10::Vector{Float64}; CZ::Vector{Float64}; WSC::Vector{Float64}
 
+    # --- Surface heat-exchange state (Hydrodynamics/HeatExchange.jl,
+    # 2026-09-23). SRON: net clear-sky-corrected shortwave irradiance,
+    # W/m^2, per waterbody (NWB) -- `compute_short_wave_radiation!`. ET/
+    # CSHE: equilibrium temperature (degC) / heat-exchange coefficient
+    # (m/s), per segment (IMX) -- `compute_equilibrium_temperature!`.
+    # WIND2 was already declared (unused until now) -- populated as
+    # WIND2[i] = WIND10[i], reusing Turbulence.jl's `compute_wind_stress!`
+    # reduction (real Fortran's own WINDH/Z0 log-law height rescale to a
+    # 2m reference is skipped there already; reusing the same value here
+    # instead of re-deriving it is not a NEW simplification). ---
+    SRON::Vector{Float64}
+    ET::Vector{Float64}; CSHE::Vector{Float64}
+
     QSS::Matrix{Float64}; VOLUH2::Matrix{Float64}; VOLDH2::Matrix{Float64}
     QUH1::Matrix{Float64}; QDH1::Matrix{Float64}
     UXBR::Matrix{Float64}; UYBR::Matrix{Float64}; VOL::Matrix{Float64}
@@ -300,6 +313,7 @@ function W2Global()
         Float64[], Float64[], Float64[],
         Float64[], Float64[], Float64[], Float64[], Float64[], Float64[],  # WIND, PHI, TAIR, TDEW, CLOUD, SRO
         Float64[], Float64[], Float64[],                                    # WIND10, CZ, WSC
+        Float64[], Float64[], Float64[],                                    # SRON, ET, CSHE
         zeros(0, 0), zeros(0, 0), zeros(0, 0),
         zeros(0, 0), zeros(0, 0),
         zeros(0, 0), zeros(0, 0), zeros(0, 0),
@@ -431,6 +445,21 @@ mutable struct W2Geometry
     # (PLACE_QIN(JW))`. Required explicit, same discipline as THETA/UPWIND/
     # ULTIMATE. ---
     PLACE_QIN::Vector{Bool}
+
+    # --- Surface heat-exchange coefficients (w2_con.csv, Tier 1, not yet
+    # read by InputReader.jl -- same gap as THETA/UPWIND/PLACE_QIN), per
+    # waterbody (NWB). See `Hydrodynamics/HeatExchange.jl`'s module
+    # docstring for the real Fortran source of each and which ones have a
+    # CSV-confirmed real value for DET (AFW/BFW/CFW/WINDH) vs. a flagged
+    # placeholder pending real Tier-1 IO or Enzyme.jl calibration
+    # (EXH2O/BETA/CC_SW/CBHE/TSED/TSEDF). Lazily defaulted (like
+    # PLACE_QIN) inside HeatExchange.jl functions, not this constructor,
+    # to avoid touching `allocate_hydro_state!`'s signature. ---
+    AFW::Vector{Float64}; BFW::Vector{Float64}; CFW::Vector{Float64}
+    WINDH::Vector{Float64}
+    EXH2O::Vector{Float64}; BETA::Vector{Float64}; CC_SW::Vector{Float64}
+    CBHE::Vector{Float64}; TSED::Vector{Float64}; TSEDF::Vector{Float64}
+    GAMMA::Matrix{Float64}  # KMX x IMX, light extinction per cell (reduced: EXH2O(JW) uniform per waterbody)
 end
 
 function W2Geometry()
@@ -461,6 +490,10 @@ function W2Geometry()
         Bool[], Bool[], Bool[],                     # TRAPEZOIDAL, FRESH_WATER, SALT_WATER
         Float64[], Bool[], Bool[],                  # THETA, UPWIND, ULTIMATE
         Bool[],                                     # PLACE_QIN
+        Float64[], Float64[], Float64[], Float64[], # AFW, BFW, CFW, WINDH
+        Float64[], Float64[], Float64[],             # EXH2O, BETA, CC_SW
+        Float64[], Float64[], Float64[],             # CBHE, TSED, TSEDF
+        zeros(0, 0),                                 # GAMMA
     )
 end
 

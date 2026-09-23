@@ -107,6 +107,11 @@ function main(; nsteps_limit::Union{Int,Nothing}=nothing, out_dir::AbstractStrin
         W2J.MetReader.update_met_conditions!(g, met, jday)
         accepted_dlt, _ = W2J.step_hydrodynamics_adaptive!(g, geom, net, tc, state, jday)
         W2J.apply_temperature_sources!(g, geom)
+        W2J.compute_short_wave_radiation!(g, geom, jday)
+        for jw in 1:g.NWB
+            W2J.compute_equilibrium_temperature!(g, geom, jw)
+        end
+        W2J.apply_surface_heat_exchange!(g, geom)
         W2J.temperature_transport!(g, geom, accepted_dlt)
         g.HYD[:, :, 4] .= g.T1
         jday += accepted_dlt / 86400.0
