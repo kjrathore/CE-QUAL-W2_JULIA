@@ -74,9 +74,12 @@ function main(; nsteps_limit::Union{Int,Nothing}=nothing, out_dir::AbstractStrin
     jday_start = 367.0   # 2017-Jan-01, relative to YEAR=2016 (TMSTRT=1 convention)
     jday_end = 731.0     # 2017-Dec-31
     dlt = tc.DLTMAX[1]
-    total_seconds = (jday_end - jday_start) * 86400.0
-    nsteps = ceil(Int, total_seconds / dlt)
-    nsteps_limit !== nothing && (nsteps = min(nsteps, nsteps_limit))
+    # Loop by jday, not a fixed step count -- a fixed budget assuming average
+    # dlt=DLTMAX undercounts once compute_curmax's QOT-aware CFL term
+    # (2026-09-23, see AdaptiveTimestep.jl) legitimately shrinks dlt near the
+    # withdrawal cell more often than DLTMAX would suggest. nsteps_cap is a
+    # generous safety bound only, not the real stopping condition.
+    nsteps_cap = nsteps_limit !== nothing ? nsteps_limit : 2_000_000
 
     isdir(out_dir) || mkpath(out_dir)
     tsr_writer = W2J.OutputWriter.open_tsr_files(out_dir, "tsr", [seg]; include_temp=true)
@@ -97,7 +100,9 @@ function main(; nsteps_limit::Union{Int,Nothing}=nothing, out_dir::AbstractStrin
     W2J.OutputWriter.write_tsr_row!(tsr_writer, g, geom, jday, dlt)
     write_profile!(jday)
 
-    for step in 1:nsteps
+    step = 0
+    while jday < jday_end && step < nsteps_cap
+        step += 1
         W2J.BoundaryReader.update_boundary_conditions!(g, boundary, jday)
         W2J.MetReader.update_met_conditions!(g, met, jday)
         accepted_dlt, _ = W2J.step_hydrodynamics_adaptive!(g, geom, net, tc, state, jday)
@@ -114,7 +119,7 @@ function main(; nsteps_limit::Union{Int,Nothing}=nothing, out_dir::AbstractStrin
         end
 
         if step % 5000 == 0
-            println("step=$step / $nsteps  jday=$(round(jday, digits=2))  ELWS[seg]=$(round(geom.ELWS[seg], digits=3))  T1[kt,seg]=$(round(g.T1[kt, seg], digits=3))")
+            println("step=$step / cap=$nsteps_cap  jday=$(round(jday, digits=2))  ELWS[seg]=$(round(geom.ELWS[seg], digits=3))  T1[kt,seg]=$(round(g.T1[kt, seg], digits=3))")
             flush(stdout)
         end
     end

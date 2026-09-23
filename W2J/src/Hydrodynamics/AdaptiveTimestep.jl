@@ -148,6 +148,30 @@ See module docstring for the reduced-physics simplifications (no TAU1/TAU2
 viscosity terms, no W term, CELRTY uses KB not KBI, celerity always
 included). Returns `Inf` if no active cell exists (avoids `minimum` over
 an empty collection erroring -- shouldn't happen for a real grid).
+
+**`QOT` addition (2026-09-23, this port's OWN scoping call, NOT in real
+Fortran)** -- confirmed by reading `w2_4_win.f90:1454` directly: the real
+`QTOT` formula never includes `QOUT`/`QOT` at all, relying instead on the
+real `DOWNSTREAM_WITHDRAWAL` selective-withdrawal algorithm spreading a
+branch's total outflow across multiple layers (by outlet elevation +
+density), which never concentrates enough flow into any ONE cell to need
+a separate CFL term. THIS port's reduced-physics `QOT` (a per-branch
+scalar summed into a SINGLE bottom-active-layer cell, see
+`Hydrodynamics/FreeSurface.jl`'s `solve_branch_free_surface!` module
+docstring) creates exactly that concentration this real formula was never
+designed to bound -- found via a real full-2017 DET run where the
+withdrawal cell's explicit temperature-source term
+(`Hydrodynamics/Transport.jl`'s `apply_temperature_sources!`,
+`TSS[kb,id] -= QOT[jb]*cold[kb,id]`) grew unboundedly and overflowed to
+`-Inf` after ~50 days, BECAUSE `dlt` was never shrunk to respect that
+cell's actual volume-turnover rate (`QOT[jb]*dlt` exceeding the cell's own
+volume in a single explicit step is an unconditional explicit-Euler
+instability, independent of any hydrodynamic CFL condition). Added as an
+extra term in `qtot` at exactly the branch's `DN_FLOW` outlet cell
+(`i==id`, `k==kb`), analogous to the existing `|QSS(K,I)|` term -- same
+units, same role (a concentrated volumetric flow the cell must be able to
+"turn over" within `dlt`), just accounting for a flow this port routes
+through `QOT` instead of `QSS`.
 """
 function compute_curmax(g, geom, dlt)
     curmax = Inf
@@ -163,6 +187,7 @@ function compute_curmax(g, geom, dlt)
                     qtot = (abs(g.U[k, i]) * geom.BHR1[k, i] + abs(g.U[k, i-1]) * geom.BHR1[k, i-1] +
                             geom.DLX[i] * abs(geom.BH2[k, i] - geom.BH1[k, i]) / dlt +
                             abs(g.QSS[k, i])) * 0.5
+                    (i == id && k == kb && g.DN_FLOW[jb]) && (qtot += abs(g.QOT[jb]) * 0.5)
                     dltcal = 1.0 / ((qtot / geom.BH1[k, i] + celrty) / geom.DLX[i] + NONZERO_EPS)
                     dltcal < curmax && (curmax = dltcal)
                 end
