@@ -460,6 +460,13 @@ mutable struct W2Geometry
     EXH2O::Vector{Float64}; BETA::Vector{Float64}; CC_SW::Vector{Float64}
     CBHE::Vector{Float64}; TSED::Vector{Float64}; TSEDF::Vector{Float64}
     GAMMA::Matrix{Float64}  # KMX x IMX, light extinction per cell (reduced: EXH2O(JW) uniform per waterbody)
+
+    # --- CSHE_MULT (Hydrodynamics/HeatExchange.jl, 2026-09-24) -- a flagged
+    # EMPIRICAL CORRECTION multiplier on the computed heat-exchange
+    # coefficient CSHE, NOT a real Fortran field. See that module's
+    # `compute_equilibrium_temperature!` docstring for the real DET
+    # diagnostic that motivated it. Lazily defaulted to 1.0 (inert). ---
+    CSHE_MULT::Vector{Float64}
 end
 
 function W2Geometry()
@@ -494,6 +501,7 @@ function W2Geometry()
         Float64[], Float64[], Float64[],             # EXH2O, BETA, CC_SW
         Float64[], Float64[], Float64[],             # CBHE, TSED, TSEDF
         zeros(0, 0),                                 # GAMMA
+        Float64[],                                   # CSHE_MULT
     )
 end
 

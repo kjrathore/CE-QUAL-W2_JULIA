@@ -5,8 +5,12 @@ version = "0.0.1"
 
 [deps]
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
+Surrogates = "6fc51010-71bc-11e9-0e15-a3fcc6593c49"
 
 [compat]
 DataFrames = "1.8.2"
+Enzyme = "0.13.204"
+Surrogates = "8.0.0"
 julia = "1.11.3"

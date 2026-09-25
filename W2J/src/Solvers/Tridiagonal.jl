@@ -39,7 +39,16 @@ function thomas_solve!(a::AbstractVector, b::AbstractVector, c::AbstractVector,
                         d::AbstractVector, x::AbstractVector)
     n = length(b)
     # Forward elimination
-    cp = similar(b); dp = similar(d)
+    # zeros(...), not similar(...) -- similar() leaves cp/dp UNINITIALIZED.
+    # The forward pass always overwrites every entry before reading it, so
+    # this was never a correctness bug for plain forward evaluation -- but
+    # Enzyme's reverse-mode AD (Hydrodynamics/HeatExchange.jl's calibration
+    # work, 2026-09-23) accumulates adjoints into cp/dp's shadow memory,
+    # and uninitialized memory there can carry garbage/NaN bit patterns
+    # that poison the adjoint even though the primal forward result stays
+    # clean -- a well-known Enzyme pitfall (documented pattern: avoid
+    # `similar` for scratch arrays inside a differentiated function).
+    cp = zeros(eltype(b), n); dp = zeros(eltype(d), n)
     cp[1] = c[1] / b[1]
     dp[1] = d[1] / b[1]
     @inbounds for i in 2:n

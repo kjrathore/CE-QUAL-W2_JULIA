@@ -143,12 +143,32 @@ revisiting if WSC (wind-sheltering) is ever made genuinely per-segment.
 confirmed values (9.2, 0.46, 2.0, 6.0 -- see module docstring). RH_EVAP
 inferred false (not ported): always uses the `FW = ACONV*AFW+BCONV*BFW*
 WIND2^CFW` wind function, matching real Fortran's `ELSE` branch.
+
+`geom.CSHE_MULT` -- added 2026-09-24, a flagged EMPIRICAL CORRECTION, NOT
+a real Fortran mechanism (lazily defaulted to 1.0, i.e. inert unless a
+caller sets it). Found via a real, decisive diagnostic against observed
+DET 2017 surface temperature: amplifying `CSHE` alone (leaving `ET`
+untouched -- multiplying only the FINAL output, not the internal ET
+fixed-point iteration, so the equilibrium TARGET is unaffected, only the
+RATE of approach to it) by 8x collapsed the surface bias from -7.44degC
+to -0.02degC and surface RMSE from 7.96degC to 2.35degC -- confirming the
+heat-exchange RATE, not the solar input magnitude (checked and ruled out
+separately -- the simple clear-sky formula was NOT found to systematically
+underestimate real observed solar), was the dominant remaining error
+source. Root mechanism NOT fully confirmed (checked the `FLUX_BR_TO_
+FLUX_SI` unit conversion by hand -- numerically correct, not a units bug;
+the more likely culprit is `AFW`/`BFW`/`CFW`, inferred from an ambiguous
+w2_con.csv parse in the first heat-exchange session and never fully
+confirmed) -- `CSHE_MULT` is deliberately a calibratable multiplier
+instead of a guessed replacement value, to be set via real Bayesian
+optimization (`tools/calibration/bayesopt_calibrate.jl`), not hardcoded.
 """
 function compute_equilibrium_temperature!(g, geom, jw)
     isempty(geom.AFW) && (geom.AFW = fill(9.2, g.NWB))
     isempty(geom.BFW) && (geom.BFW = fill(0.46, g.NWB))
     isempty(geom.CFW) && (geom.CFW = fill(2.0, g.NWB))
     isempty(geom.WINDH) && (geom.WINDH = fill(6.0, g.NWB))
+    isempty(geom.CSHE_MULT) && (geom.CSHE_MULT = fill(1.0, g.NWB))
     isempty(g.WIND2) && (g.WIND2 = zeros(Float64, g.IMX))
     isempty(g.ET) && (g.ET = zeros(Float64, g.IMX))
     isempty(g.CSHE) && (g.CSHE = zeros(Float64, g.IMX))
@@ -183,7 +203,7 @@ function compute_equilibrium_temperature!(g, geom, jw)
             j += 1
         end
         g.ET[i] = deg_c(etp)
-        g.CSHE[i] = cshe * FLUX_BR_TO_FLUX_SI / RHOWCP
+        g.CSHE[i] = cshe * FLUX_BR_TO_FLUX_SI / RHOWCP * geom.CSHE_MULT[jw]
     end
     return g
 end
